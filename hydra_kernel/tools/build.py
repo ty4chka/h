@@ -140,6 +140,90 @@ def check_android_optional_dependency_fallback() -> None:
             _sys.modules.pop(probe, None)
 
 
+async def check_mtproxy_fake_tls() -> None:
+    """Exercise an ``ee`` handshake without contacting a public proxy."""
+
+    import hashlib
+    import hmac
+    import time
+
+    from hydra_kernel.mtproxy import (
+        FakeTLSSecret,
+        _FakeTLSStreamReader,
+        _FakeTLSStreamWriter,
+        is_fake_tls_secret,
+        perform_fake_tls_handshake,
+    )
+
+    encoded = "ee" + ("13" * 16) + b"www.example.test".hex()
+    secret = FakeTLSSecret.parse(encoded)
+    assert is_fake_tls_secret(encoded)
+    served = asyncio.get_running_loop().create_future()
+
+    async def proxy(reader, writer) -> None:
+        try:
+            client_hello = await reader.readexactly(517)
+            assert client_hello[:5] == b"\x16\x03\x01\x02\x00"
+            zeroed = bytearray(client_hello)
+            client_random = bytes(zeroed[11:43])
+            zeroed[11:43] = b"\x00" * 32
+            digest = hmac.new(secret.key, bytes(zeroed), hashlib.sha256).digest()
+            timestamp = bytes(client_random[28 + index] ^ digest[28 + index] for index in range(4))
+            assert abs(int.from_bytes(timestamp, "little") - int(time.time())) < 5
+
+            # Same three-record welcome shape emitted by MTProxy FakeTLS.
+            hello = bytearray(b"\x16\x03\x03\x00\x7a" + (b"\x00" * 122))
+            hello[5] = 0x02
+            hello[6:9] = b"\x00\x00\x7a"
+            hello[9:11] = b"\x03\x03"
+            hello[43] = 32
+            hello[44:76] = client_hello[44:76]
+            change_cipher_spec = b"\x14\x03\x03\x00\x01\x01"
+            initial_data = b"\x17\x03\x03\x00\x02OK"
+            transcript = bytearray(hello + change_cipher_spec + initial_data)
+            transcript[11:43] = b"\x00" * 32
+            hello[11:43] = hmac.new(
+                secret.key, client_random + bytes(transcript), hashlib.sha256
+            ).digest()
+            writer.write(hello + change_cipher_spec + initial_data)
+            await writer.drain()
+
+            record_header = await reader.readexactly(5)
+            assert record_header[:3] == b"\x17\x03\x03"
+            size = int.from_bytes(record_header[3:5], "big")
+            assert await reader.readexactly(size) == b"hydra"
+            writer.write(b"\x17\x03\x03\x00\x05reply")
+            await writer.drain()
+            served.set_result(None)
+        except BaseException as exc:  # propagate failures to the build caller
+            if not served.done():
+                served.set_exception(exc)
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    writer = None
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await perform_fake_tls_handshake(reader, writer, secret)
+        tls_writer = _FakeTLSStreamWriter(writer)
+        tls_reader = _FakeTLSStreamReader(reader)
+        tls_writer.write(b"hydra")
+        await tls_writer.drain()
+        assert await tls_reader.readexactly(5) == b"reply"
+        await asyncio.wait_for(served, timeout=3)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # server intentionally closes after the probe
+                pass
+        server.close()
+        await server.wait_closed()
+
+
 def check_stale_native_lang_fallback() -> None:
     """MCUB nested strings survive an older compiled api.lang extension.
 
@@ -1454,6 +1538,13 @@ async def main() -> int:
         print(ok("offline deps: Android/Termux fallback для неподдерживаемого psutil"))
     except AssertionError as e:
         print(fail(f"offline deps: {e}"))
+        failures += 1
+
+    try:
+        await check_mtproxy_fake_tls()
+        print(ok("MTProxy FakeTLS: ee-secret handshake и TLS record bridge"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"MTProxy FakeTLS: {type(e).__name__}: {e}"))
         failures += 1
 
     try:

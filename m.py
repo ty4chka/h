@@ -36,7 +36,7 @@ except ImportError:
     from telethon import TelegramClient
     MCUB_READY = False
 
-from telethon import connection
+from hydra_kernel.mtproxy import connection_class_for_secret
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -1841,10 +1841,9 @@ def get_client_kwargs(session_name, proxy_enabled=False):
     }
     if proxy_enabled and hasattr(config, 'PROXY') and config.PROXY:
         kwargs["proxy"] = (config.PROXY["addr"], config.PROXY["port"], config.PROXY["secret"])
-        # Telethon recommends randomized intermediate for MTProto proxies.
-        # It also provides the best standard-Telethon compatibility with
-        # modern ``dd``/``ee`` secrets from t.me/proxy links.
-        kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+        # ``ee`` links need a FakeTLS record handshake before Telethon's
+        # normal randomized-intermediate MTProto transport starts.
+        kwargs["connection"] = connection_class_for_secret(config.PROXY["secret"])
     return kwargs
 
 

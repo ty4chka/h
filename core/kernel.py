@@ -23,6 +23,7 @@ from .lib.telethon_mcub import (
 )
 from .events.dispatcher import EventDispatcher
 from .modules import register as register_module, get as get_module
+from hydra_kernel.mtproxy import connection_class_for_secret
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,9 @@ class HydraKernel:
             "app_version": app_version,
         }
         if proxy:
-            from telethon import connection
-            client_kwargs["proxy"] = (proxy["addr"], proxy["port"], proxy.get("secret", ""))
-            client_kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+            secret = proxy.get("secret", "")
+            client_kwargs["proxy"] = (proxy["addr"], proxy["port"], secret)
+            client_kwargs["connection"] = connection_class_for_secret(secret)
 
         # Unified Telegram Client
         self.client = UnifiedTelegramClient(

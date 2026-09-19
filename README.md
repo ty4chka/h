@@ -66,8 +66,9 @@ sh tools/build_go.sh
 
 ## 🌐 MTProto-прокси
 
-Hydra принимает MTProto-прокси из `t.me/proxy` и использует для него
-рекомендованный Telethon transport `ConnectionTcpMTProxyRandomizedIntermediate`.
+Hydra принимает MTProto-прокси из `t.me/proxy`: обычные/`dd…` секреты идут
+через рекомендованный Telethon transport `ConnectionTcpMTProxyRandomizedIntermediate`,
+а `ee…` FakeTLS-секреты автоматически проходят нативный FakeTLS handshake.
 Скопируйте `data/config.example.json` в локальный `data/config.json` (он
 игнорируется Git) и заполните поля:
 
@@ -83,10 +84,8 @@ Hydra принимает MTProto-прокси из `t.me/proxy` и исполь�
 Либо задайте те же значения только для одного запуска через
 `HYDRA_PROXY_ENABLED`, `HYDRA_PROXY_ADDR`, `HYDRA_PROXY_PORT` и
 `HYDRA_PROXY_SECRET`. Перезапустите Hydra после изменения. Не публикуйте
-`api_hash`, session-файлы или proxy secret. Если провайдер принимает только
-строгий FakeTLS (`ee…`) и разрывает соединение, запросите у него обычный или
-`dd…` MTProto-secret: стандартный Telethon не реализует полный FakeTLS
-handshake.
+`api_hash`, session-файлы или proxy secret. Для `ee…` не убирайте префикс
+или домен из секрета: Hydra использует их для проверки FakeTLS-соединения.
 
 ## 🧩 Установка MCUB-модуля
 
