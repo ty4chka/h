@@ -59,7 +59,7 @@ def source_fixture(reference: Path, fixture: Path) -> tuple[str, Path]:
 # ---------------------------------------------------------------- compile
 def compile_trees() -> int:
     total = 0
-    for rel in ("hydra_kernel", "core", "core_inline", "hydra_modules"):
+    for rel in ("hydra_kernel", "core", "core_inline", "hydra_modules", "mcub_engine"):
         tree = ROOT / rel
         if not tree.exists():
             continue
@@ -211,6 +211,20 @@ async def check_telethon_both_direction_subscription() -> None:
             1000, True, 77, ".ping",
         ), msg
 
+        incoming = types.SimpleNamespace(
+            chat_id=501,
+            sender_id=2000,
+            raw_text=".ping",
+            out=False,
+            message=types.SimpleNamespace(id=78),
+        )
+        await client.handlers[0][0](incoming)
+        assert len(received) == 2
+        msg = received[1]
+        assert (msg.sender_id, msg.outgoing, msg.message_id, msg.text) == (
+            2000, False, 78, ".ping",
+        ), msg
+
         unsubscribe()
         assert len(client.removed) == 2, "отписка не сняла обе Telethon-подписки"
     finally:
@@ -225,22 +239,49 @@ async def check_live_compatibility_shims() -> None:
 
     from hydra_kernel.api.inline import CallbackQueryEvent
     from hydra_kernel.compat.base import ClientProxy
-    from hydra_kernel.kernel.transport import Message
+    from hydra_kernel.kernel.transport import Message, NullTransport
 
     class RawMessage:
         sender = "sender"
         reply_to = types.SimpleNamespace(reply_to_msg_id=71)
+        mentioned = True
+        is_group = True
+        is_private = False
 
         async def get_reply_message(self):
             return "reply"
 
-    event = types.SimpleNamespace(message=RawMessage())
+        async def get_chat(self):
+            return "chat"
+
+        async def get_sender(self):
+            return "resolved-sender"
+
+    native_event_client = object()
+    event = types.SimpleNamespace(message=RawMessage(), client=native_event_client)
     message = Message(chat_id=500, sender_id=1000, text=".man", message_id=77, raw=event)
     assert message.id == 77
     assert message.reply_to_msg_id == 71 and message.is_reply
-    assert message.sender == "sender"
+    assert message.sender == "sender" and message.client is native_event_client
+    assert message.mentioned and message.is_group and not message.is_private
     assert await message.get_reply_message() == "reply"
+    assert await message.get_chat() == "chat" and await message.get_sender() == "resolved-sender"
     assert CallbackQueryEvent("close", 1000, chat_id=500).input_chat == 500
+
+    # Setup-style modules receive the same configurable owner identity through
+    # the offline client as they do through Telethon's `get_me()`.
+    offline_transport = NullTransport(me_id=2468)
+    assert (await offline_transport.client.get_me()).id == 2468
+    offline_proxy = ClientProxy(offline_transport)
+    await offline_proxy.send_message("me", "self-alias")
+    assert offline_transport.sent[-1].chat_id == 2468
+    assert await offline_proxy.send_read_acknowledge(2468)
+
+    from mcub_engine.utils_inject import parse_arguments
+
+    parser = parse_arguments('.oa --test=reconnect --flash "hello world"')
+    assert parser.raw_args == '--test=reconnect --flash "hello world"'
+    assert parser.get_kwarg("test") == "reconnect" and parser.get_flag("flash")
 
     class NativeConversation:
         def __init__(self):
@@ -574,6 +615,42 @@ async def modules_suite() -> None:
     assert any("🌐" in m.text for m in h.transport.sent), "родная .mylang не ответила"
 
 
+# Full production inventory.  Entries use harmless usage/menu branches; the
+# two omitted actions are registered below but deliberately not executed by an
+# automated smoke run because they replace the process or compile files.
+OWNED_COMMAND_PROBES = (
+    "cfg", "lm", "unlm", "hmods", "compile", "modinfo", "deps", "mcubmods",
+    "mylang", "languages", "lang",
+    "convert", "fix", "services", "set_key", "show_keys", "stats",
+    "api_protection", "api_reset", "api_suspend", "lockdown",
+    "text", "serverinfo", "sysinfo", "start",
+    "terminal", "term", "shell", "exec", "terminal_info", "terminal_pwd",
+    "terminal_ls", "terminal_whoami", "terminal_uname", "terminal_df", "neofetch",
+    "approve", "decline", "trustlist", "untrust", "access",
+    "vector", "vecupdate", "vecme", "vecdl",
+    "mute", "unmute", "ban", "unban", "warn", "unwarn", "kick",
+    "cleandeleted", "cleandel", "cleanup",
+    "git", "wget",
+    "catbox", "envs", "kappa", "0x0", "x0", "tmpfiles", "pomf", "bash", "upload",
+    "man", "manhide", "manunhide", "help",
+    "oa", "agent", "oaexport", "oaimport", "skills", "skillinstall", "ssinstall",
+    "sendss", "imss", "delss", "oaplugin",
+    "rf", "rfcache", "stags", "tictactoe", "tictacai",
+    # Exercise OpenAgent's MCUB ArgumentParser without a provider request.
+    "oa --test=reconnect", "oa --clear",
+)
+OWNED_COMMAND_NO_RUN = {
+    "compileall": "writes/compiles local module files",
+    "restart": "replaces the running userbot process",
+}
+_BRIDGE_COMMANDS = {"cb", "it", "cbf", "iqs", "iq"}
+
+
+def _command_from_pattern(pattern: str) -> str | None:
+    match = re.search(r"\^\\\.([A-Za-z0-9_]+)", pattern)
+    return match.group(1).lower() if match else None
+
+
 async def owned_mcub_modules_suite() -> None:
     """Диспетчер m.py подхватывает сохранённые modules/mcub_mods/.
 
@@ -616,6 +693,188 @@ async def owned_mcub_modules_suite() -> None:
             close_token, sender_id=1000, chat_id=500, message_id=forms[0].message_id
         )
         assert forms[0] not in h.transport.sent, ".man close callback не удалил форму"
+
+        # `inline_query_and_click` returns a materialized InlineResult rather
+        # than a bare normalized message.  Its programmatic click must route
+        # through the actual callback dispatcher and preserve follow-up MCUB
+        # buttons; Man and OpenAgent use this live-only-looking pattern.
+        iface = h.loader.adapter_for("mcub").iface
+        inline_ok, inline_result = await iface.inline_query_and_click(500, "man")
+        assert inline_ok and getattr(inline_result, "message_id", 0), \
+            "inline_query_and_click did not return an editable result"
+        assert inline_result.peer_id == 500, \
+            "materialized inline result lost its Telethon peer_id alias"
+        assert await inline_result.click(0), \
+            "programmatic inline-result click did not reach the MCUB callback"
+
+        # Inventory is deliberately exhaustive: every production command is
+        # either smoke-invoked below or explicitly classified as destructive.
+        probe_names = {probe.split(maxsplit=1)[0] for probe in OWNED_COMMAND_PROBES}
+        expected_commands = probe_names | set(OWNED_COMMAND_NO_RUN)
+        discovered_commands = set()
+        for record in h.transport._subs:
+            pattern = record.get("pattern")
+            if pattern is not None:
+                name = _command_from_pattern(pattern.pattern)
+                if name:
+                    discovered_commands.add(name)
+        for _handler, builder in h.transport.client.handlers:
+            raw_pattern = getattr(builder, "kwargs", {}).get("pattern")
+            if isinstance(raw_pattern, str):
+                name = _command_from_pattern(raw_pattern)
+                if name:
+                    discovered_commands.add(name)
+        discovered_commands -= _BRIDGE_COMMANDS
+        assert discovered_commands == expected_commands, (
+            "непокрытые/устаревшие production-команды: "
+            f"missing={sorted(expected_commands - discovered_commands)}, "
+            f"extra={sorted(discovered_commands - expected_commands)}"
+        )
+
+        def setup_hits(text: str) -> set[str]:
+            hits = set()
+            for _handler, builder in h.transport.client.handlers:
+                raw_pattern = getattr(builder, "kwargs", {}).get("pattern")
+                matcher = getattr(builder, "pattern", None)
+                if isinstance(raw_pattern, str) and callable(matcher) and matcher(text):
+                    name = _command_from_pattern(raw_pattern)
+                    if name:
+                        hits.add(name)
+            return hits
+
+        assert setup_hits(".compileall") == {"compileall"}, ".compile перехватывает .compileall"
+        assert setup_hits(".compile module") == {"compile"}, ".compile не маршрутизируется точно"
+        assert not setup_hits(".cfgextra"), ".cfg перехватывает чужой префикс"
+
+        # MCUB commands must be visible for both message directions; native
+        # core/setup handlers are intentionally outgoing-only.
+        for command_name in iface.command_owners:
+            matching = [
+                record for record in h.transport._subs
+                if record.get("pattern") is not None
+                and record["pattern"].match(f".{command_name}")
+            ]
+            assert any(record["incoming"] and record["outgoing"] for record in matching), (
+                f"MCUB .{command_name} не имеет двунаправленной подписки"
+            )
+
+        import types
+        import modules.terminal as terminal_module
+        from utils import misc as native_utils
+
+        def instance_named(name: str):
+            return next(
+                instance
+                for instance in iface._class_module_instances.values()
+                if getattr(instance, "name", None) == name
+            )
+
+        # Keep all smoke branches deterministic and non-destructive.  The
+        # handlers themselves are still used; only external I/O is replaced.
+        original_execute = terminal_module.execute_in_chroot
+
+        async def fake_execute_in_chroot(*_args, **_kw):
+            return "audit chroot output", 0
+
+        terminal_module.execute_in_chroot = fake_execute_in_chroot
+        vector = instance_named("Vector")
+        original_net_req = vector._net_req
+
+        async def fake_vector_net(method, path, **_kw):
+            return {"username": "vector_audit_bot"} if path == "/api/tg-bot" else None
+
+        vector._net_req = fake_vector_net
+        uploader = instance_named("k:uploader")
+        upload_globals = uploader.catbox_handler.__func__.__globals__
+        missing = object()
+        original_requests = upload_globals.get("requests", missing)
+        # The no-reply branch then proves each handler reaches its own usage
+        # response without making an upload/network request.
+        upload_globals["requests"] = object()
+        openagent = instance_named("OpenAgent")
+        session_manager = openagent.session_manager
+
+        async def in_memory_session_save():
+            session_manager._saved_generation = session_manager._save_generation
+
+        session_manager.save = in_memory_session_save
+
+        async def invoke(command: str):
+            # Native terminal aliases deliberately share one rate-limit bucket;
+            # clear only test state so each command's own branch is exercised.
+            native_utils._rate_limits.pop(1000, None)
+            before = len(h.transport.sent)
+            await asyncio.wait_for(
+                h.transport.inject(500, f".{command}", sender_id=1000, outgoing=True),
+                timeout=3,
+            )
+            replies = h.transport.sent[before:]
+            assert replies and any(reply.text.strip() != f".{command}" for reply in replies), (
+                f".{command}: нет ответа"
+            )
+            return replies[-1]
+
+        try:
+            for command in OWNED_COMMAND_PROBES:
+                await invoke(command)
+
+            # The `.oa` sessions panel is a real programmatic inline form.
+            # Verify its input bridge as well as the command reply itself.
+            panel = await invoke("oa")
+            assert ".it 1" in panel.text and any(
+                button.get("input")
+                for row in (panel.buttons or [])
+                for button in row
+                if isinstance(button, dict)
+            ), "OpenAgent panel lost its input callbacks"
+            menu_no = h.bridge._msg_no[panel.chat_id][panel.message_id]
+            await h.transport.inject(
+                500, f".it 1 {menu_no} audit-session", sender_id=1000, outgoing=True
+            )
+            assert "audit-session" in panel.text, "OpenAgent .it input did not update its session panel"
+
+            # Functional MCUB callback forms still use the normal callback
+            # router (not an artificial direct call).
+            api_form = await invoke("api_protection")
+            api_menu_no = h.bridge._msg_no[api_form.chat_id][api_form.message_id]
+            await h.transport.inject(
+                500, f".cb 1 {api_menu_no}", sender_id=1000, outgoing=True
+            )
+            assert "API protection" in api_form.text, "API protection callback did not edit its form"
+
+            # A tagged incoming message exercises normalized Message.mentioned,
+            # get_chat/get_sender, is_private and the `me` ClientProxy alias.
+            await invoke("stags on")
+
+            class TaggedRaw:
+                mentioned = True
+                is_private = False
+                sender = types.SimpleNamespace(bot=False, first_name="Audit sender")
+
+                async def get_chat(self):
+                    return types.SimpleNamespace(username="audit_chat", title="Audit chat")
+
+                async def get_sender(self):
+                    return self.sender
+
+            before = len(h.transport.sent)
+            await h.transport.inject(
+                -100_123,
+                "@hydra audit tag",
+                sender_id=2000,
+                outgoing=False,
+                raw=TaggedRaw(),
+            )
+            assert any(message.chat_id == h.transport.me_id for message in h.transport.sent[before:]), (
+                "silent-tags watcher did not log a normalized tagged incoming message"
+            )
+        finally:
+            terminal_module.execute_in_chroot = original_execute
+            vector._net_req = original_net_req
+            if original_requests is missing:
+                upload_globals.pop("requests", None)
+            else:
+                upload_globals["requests"] = original_requests
     finally:
         for name in list(h.registry.names()):
             await h.unload_module(name)
@@ -787,7 +1046,7 @@ async def main() -> int:
     failures = 0
 
     n = compile_trees()
-    print(ok(f"compile: {n} .py файлов (hydra_kernel + core + core_inline)"))
+    print(ok(f"compile: {n} .py файлов (hydra_kernel + core + core_inline + mcub_engine)"))
 
     try:
         check_resolver()
@@ -812,7 +1071,7 @@ async def main() -> int:
 
     try:
         await check_telethon_both_direction_subscription()
-        print(ok("Telethon transport: incoming+outgoing разделены на две живые подписки"))
+        print(ok("Telethon transport: incoming+outgoing разделены на две живые подписки и доставляются"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"Telethon transport: {type(e).__name__}: {e}"))
         failures += 1
@@ -856,7 +1115,7 @@ async def main() -> int:
 
     try:
         await owned_mcub_modules_suite()
-        print(ok("собственные modules/mcub_mods/: автозагрузка, .man и карточка OpenAgent работают"))
+        print(ok("собственные modules/mcub_mods/: все 88 команды инвентаризированы; 86 safe-веток, OpenAgent input и silent-tags проверены"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"owned MCUB modules: {type(e).__name__}: {e}"))
         failures += 1

@@ -1162,15 +1162,23 @@ async def mcubmods_handler(event):
 # ============================================
 
 def setup(client):
-    """Register handlers."""
-    client.add_event_handler(lm_handler, events.NewMessage(pattern=r"\.lm", outgoing=True))
-    client.add_event_handler(unlm_handler, events.NewMessage(pattern=r"\.unlm", outgoing=True))
-    client.add_event_handler(hmods_handler, events.NewMessage(pattern=r"\.hmods", outgoing=True))
-    client.add_event_handler(compile_handler, events.NewMessage(pattern=r"\.compile", outgoing=True))
-    client.add_event_handler(compileall_handler, events.NewMessage(pattern=r"\.compileall", outgoing=True))
-    client.add_event_handler(modinfo_handler, events.NewMessage(pattern=r"\.modinfo", outgoing=True))
-    client.add_event_handler(deps_handler, events.NewMessage(pattern=r"\.deps", outgoing=True))
-    client.add_event_handler(mcubmods_handler, events.NewMessage(pattern=r"\.mcubmods", outgoing=True))
+    """Register handlers with exact command boundaries.
+
+    A bare ``\\.compile`` also matches ``.compileall`` in Telethon, which
+    used to run both handlers for the latter command.  Keep setup-style native
+    modules on the same exact-command routing contract as Hydra's adapters.
+    """
+    def command_pattern(name: str) -> str:
+        return rf"(?i)^\.{name}(?:\s|$)"
+
+    client.add_event_handler(lm_handler, events.NewMessage(pattern=command_pattern("lm"), outgoing=True))
+    client.add_event_handler(unlm_handler, events.NewMessage(pattern=command_pattern("unlm"), outgoing=True))
+    client.add_event_handler(hmods_handler, events.NewMessage(pattern=command_pattern("hmods"), outgoing=True))
+    client.add_event_handler(compile_handler, events.NewMessage(pattern=command_pattern("compile"), outgoing=True))
+    client.add_event_handler(compileall_handler, events.NewMessage(pattern=command_pattern("compileall"), outgoing=True))
+    client.add_event_handler(modinfo_handler, events.NewMessage(pattern=command_pattern("modinfo"), outgoing=True))
+    client.add_event_handler(deps_handler, events.NewMessage(pattern=command_pattern("deps"), outgoing=True))
+    client.add_event_handler(mcubmods_handler, events.NewMessage(pattern=command_pattern("mcubmods"), outgoing=True))
 
 modules_help = {
     "module_loader": {

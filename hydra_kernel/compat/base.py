@@ -197,12 +197,40 @@ class ClientProxy:
         language = str(args[2]) if len(args) > 2 else str(kw.get("lang") or "")
         return f"[{language}] {text}".strip()
 
+    def _chat_id(self, entity: Any) -> int:
+        """Normalize the common Telethon self aliases for our transport."""
+
+        if entity in (None, "me", "self"):
+            return self._t.me_id
+        return int(entity)
+
     async def send_message(self, entity: Any, text: str, **kw: Any) -> Any:
-        return await self._t.send(int(entity), text, **kw)
+        try:
+            chat_id = self._chat_id(entity)
+        except (TypeError, ValueError):
+            # Less common Telethon peers (InputPeer/username) belong to the
+            # native client rather than the integer-only normalized transport.
+            client = self._native_client()
+            sender = getattr(client, "send_message", None) if client is not None else None
+            if not callable(sender):
+                raise
+            result = sender(entity, text, **kw)
+            return await result if hasattr(result, "__await__") else result
+        return await self._t.send(chat_id, text, **kw)
+
+    async def send_read_acknowledge(self, *args: Any, **kw: Any) -> bool:
+        """Mark a message read, or deterministically no-op in offline smoke."""
+
+        client = self._native_client()
+        method = getattr(client, "send_read_acknowledge", None) if client is not None else None
+        if callable(method):
+            result = method(*args, **kw)
+            return await result if hasattr(result, "__await__") else bool(result)
+        return True
 
     async def edit_message(self, entity: Any, message: Any, text: str, **kw: Any) -> Any:
         mid = message if isinstance(message, int) else getattr(message, "message_id", 0)
-        return await self._t.edit(int(entity), mid, text, **kw)
+        return await self._t.edit(self._chat_id(entity), mid, text, **kw)
 
     async def delete_messages(self, entity: Any, messages: Any, **kw: Any) -> Any:
         """Telethon-compatible deletion, including a deterministic offline no-op."""
@@ -219,7 +247,7 @@ class ClientProxy:
         for message in ids:
             mid = message if isinstance(message, int) else getattr(message, "message_id", 0)
             if mid:
-                await self._t.delete(int(entity), int(mid))
+                await self._t.delete(self._chat_id(entity), int(mid))
                 # Старый MCUB суммирует ``pts_count`` у результата удаления.
                 affected.append(types.SimpleNamespace(pts_count=1))
         return affected

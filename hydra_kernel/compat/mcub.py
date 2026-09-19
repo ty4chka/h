@@ -31,6 +31,83 @@ from ..api.permissions import ADMIN
 logger = logging.getLogger("hydra_kernel.compat.mcub")
 
 
+class _MaterializedInlineMessage:
+    """Local editable result of an MCUB inline form/query.
+
+    Userbot accounts cannot receive native ``CallbackQuery`` updates for their
+    own inline keyboards.  Hydra therefore materializes a form or first inline
+    result as a normal message plus its ButtonBridge callbacks.  Some
+    production MCUB modules (notably OpenAgent and Vector) immediately call
+    ``sms.click(0)`` to turn that result into an editable status event;
+    providing this tiny result object preserves that flow instead of making
+    every command wait for a five-second timeout.
+    """
+
+    def __init__(self, iface: "McubKernelInterface", message: Any) -> None:
+        self._iface = iface
+        self._message = message
+        self.chat_id = getattr(message, "chat_id", None)
+        self.id = getattr(message, "id", getattr(message, "message_id", 0))
+        self.message_id = self.id
+        self.unit_id = str(self.id)
+        self.form_id = self.unit_id
+
+    @property
+    def message(self) -> Any:
+        return self._message
+
+    @property
+    def peer_id(self) -> Any:
+        """Telethon message alias used by file/form-oriented MCUB modules."""
+
+        return self.chat_id
+
+    async def edit(self, text: str, buttons: Any = None, **kw: Any) -> "_MaterializedInlineMessage":
+        if self.chat_id is None:
+            return self
+        if buttons is not None:
+            kw["buttons"] = self._iface._normalize_buttons(buttons)
+        edited = await self._iface.h.transport.edit(int(self.chat_id), int(self.message_id or 0), text, **kw)
+        self._message = edited
+        self.id = getattr(edited, "id", getattr(edited, "message_id", self.id))
+        self.message_id = self.id
+        return self
+
+    async def delete(self) -> None:
+        if self.chat_id is not None:
+            await self._iface.h.transport.delete(int(self.chat_id), int(self.message_id or 0))
+
+    async def click(self, index: Any = 0, *args: Any, **kw: Any) -> bool:
+        """Programmatically press a materialized callback button.
+
+        This mirrors the small ``InlineResult.click`` subset used by MCUB
+        modules.  It routes through Hydra's normal callback dispatcher, so the
+        callback receives a real :class:`CallbackQueryEvent` with an editable
+        chat/message target.
+        """
+
+        rows = getattr(self._message, "buttons", None) or []
+        flat = [button for row in rows for button in (row if isinstance(row, (list, tuple)) else [row])]
+        if isinstance(index, (tuple, list)) and len(index) >= 2:
+            try:
+                button = rows[int(index[0])][int(index[1])]
+            except (IndexError, TypeError, ValueError):
+                return False
+        else:
+            try:
+                button = flat[int(index)]
+            except (IndexError, TypeError, ValueError):
+                return False
+        data = button.get("data") if isinstance(button, dict) else getattr(button, "data", None)
+        if isinstance(data, bytes):
+            data = data.decode(errors="replace")
+        if not data or self.chat_id is None:
+            return False
+        return await self._iface.h._on_callback(
+            str(data), self._iface.h.owner_id, int(self.chat_id), int(self.message_id or 0), None
+        )
+
+
 class Colors:
     """Безопасная ANSI-поверхность MCUB.
 
@@ -561,7 +638,15 @@ class McubKernelInterface:
 
     def register_callback_handler(self, prefix: str | bytes, handler: Callable) -> None:
         normalized = prefix.decode(errors="replace") if isinstance(prefix, bytes) else str(prefix)
-        self.h.register_callback(normalized, handler)
+
+        async def wrapper(event: Any) -> Any:
+            self._prepare_callback_event(event)
+            result = handler(event)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        self.h.register_callback(normalized, wrapper)
 
     # -- inline инструменты (как в MCUB-fork) --
     async def inline_query_and_click(self, chat_id: int, query: str, *args: Any, **kw: Any) -> Tuple[bool, Any]:
@@ -605,7 +690,7 @@ class McubKernelInterface:
         if kw.get("reply_to") is not None:
             send_kw["reply_to"] = kw["reply_to"]
         sent = await self.h.transport.send(int(chat_id), str(body), **send_kw)
-        return True, sent
+        return True, _MaterializedInlineMessage(self, sent)
 
     def _normalize_buttons(self, buttons: Any) -> Any:
         """telethon KeyboardInlineButton (data=uuid-токен) -> dict-кнопки ядра."""
@@ -619,7 +704,38 @@ class McubKernelInterface:
             out = []
             for btn in row:
                 if isinstance(btn, dict):
-                    out.append(btn)
+                    # ModuleBase.Button.input uses MCUB's temporary-inline
+                    # registry.  Convert it to the textual ButtonBridge input
+                    # protocol instead of leaving an inert private dict on the
+                    # rendered form.
+                    if btn.get("_mcub_input"):
+                        source_token = str(btn.get("uuid") or "")
+                        bridge = getattr(self.h, "bridge", None)
+                        entry = self.inline_callback_map.get(source_token)
+                        if source_token and bridge is not None and entry is not None:
+                            token = f"mcub_it:{source_token}"
+
+                            async def _input(call: Any, value: str, _token: str = source_token) -> Any:
+                                self._prepare_callback_event(call)
+                                temp_entry = self.inline_callback_map.get(_token)
+                                if not temp_entry:
+                                    return None
+                                handler = temp_entry.get("handler")
+                                if not callable(handler):
+                                    return None
+                                result = handler(call, value, temp_entry.get("data"))
+                                if inspect.isawaitable(result):
+                                    return await result
+                                return result
+
+                            bridge.register_input(token, _input, ())
+                            out.append({"text": btn.get("text", "?"), "data": token, "input": True})
+                        else:
+                            # Keep an informative, non-clickable label if a
+                            # third-party module supplied a stale temp token.
+                            out.append({"text": btn.get("text", "?")})
+                    else:
+                        out.append(btn)
                     continue
                 data = getattr(btn, "data", None)
                 if data is None:
@@ -631,6 +747,7 @@ class McubKernelInterface:
                     token = f"mcub_cb{n}:{src_tok}"
 
                     async def _cb(call, _tok=src_tok):
+                        self._prepare_callback_event(call)
                         entry = getattr(self, "inline_callback_map", {}).get(_tok)
                         if not entry:
                             return
@@ -658,6 +775,33 @@ class McubKernelInterface:
             rows.append(out)
         return rows
 
+    def _prepare_callback_event(self, event: Any) -> Any:
+        """Teach a generic Hydra callback event to render MCUB buttons.
+
+        A module callback receives :class:`CallbackQueryEvent`, not the
+        interface that created its Telethon-style ``Button`` objects.  Bind a
+        one-shot edit adapter before executing it so ``event.edit(...,
+        buttons=[Button.inline(...)])`` keeps its callbacks and text bridge.
+        """
+
+        if getattr(event, "_mcub_button_iface", None) is self:
+            return event
+        original_edit = getattr(event, "edit", None)
+        if not callable(original_edit):
+            return event
+
+        async def edit(text: str, **kw: Any) -> Any:
+            if "buttons" in kw:
+                kw["buttons"] = self._normalize_buttons(kw["buttons"])
+            return await original_edit(text, **kw)
+
+        try:
+            event.edit = edit
+            event._mcub_button_iface = self
+        except Exception:  # pragma: no cover - immutable third-party event
+            pass
+        return event
+
     async def inline_form(
         self,
         chat_id: int,
@@ -667,17 +811,17 @@ class McubKernelInterface:
         title: Optional[str] = None,
         fields: Optional[dict[str, Any]] = None,
         **kw: Any,
-    ) -> Tuple[bool, Optional[str]]:
-        """Отправить MCUB form; ``title/fields`` — вариант настоящего ModuleBase."""
+    ) -> Tuple[bool, Any]:
+        """Отправить MCUB form and return an editable materialized result."""
 
         body = title if title is not None else (text or "")
         if fields:
             body += "".join(f"\n{k}: {v}" for k, v in fields.items())
         try:
-            await self.h.transport.send(
+            sent = await self.h.transport.send(
                 int(chat_id), body, buttons=self._normalize_buttons(buttons)
             )
-            return True, None
+            return True, _MaterializedInlineMessage(self, sent)
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
 
@@ -797,6 +941,16 @@ class McubAdapter(CompatAdapter):
         # поверхность самого utils, которую ждут настоящие MCUB-модули
         if not hasattr(utils_mod, "Strings"):
             utils_mod.Strings = Strings
+
+        # Real ``core.ModuleBase.args()`` asks the top-level ``utils`` package
+        # for MCUB's stateful ArgumentParser (``get_flag()``, ``get_kwarg()``,
+        # ``raw_args``).  Hydra's native utils intentionally only exposes the
+        # simple list helpers, which made OpenAgent's `.oa`/`.agent` fail at
+        # runtime with ``'list' object has no attribute 'get_flag'``.
+        if not hasattr(utils_mod, "parse_arguments"):
+            from mcub_engine.utils_inject import parse_arguments
+
+            utils_mod.parse_arguments = parse_arguments
 
         if not hasattr(utils_mod, "answer"):
             async def _answer(event: Any, text: str, **kw: Any) -> Any:

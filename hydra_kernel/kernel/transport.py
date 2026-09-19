@@ -91,11 +91,34 @@ class Message:
         """NullTransport не парсит разметку, но Hikka ждёт iterable."""
         return []
 
+    def _raw_sources(self) -> tuple[Any, ...]:
+        """Return both shapes used by Telethon events without exposing them.
+
+        ``events.NewMessage.Event`` keeps most chat metadata on the event, but
+        a few Telethon versions expose it on ``event.message`` instead.  Hydra
+        hands modules a normalized :class:`Message`, so all compatibility
+        aliases must check both locations.
+        """
+
+        raw_message = getattr(self.raw, "message", None)
+        return tuple(source for source in (self.raw, raw_message) if source is not None)
+
+    def _raw_flag(self, name: str) -> Optional[bool]:
+        """Read a boolean Telethon chat flag, if the raw event has one."""
+
+        for source in self._raw_sources():
+            try:
+                value = getattr(source, name, None)
+            except Exception:  # pragma: no cover - foreign event descriptors
+                continue
+            if value is not None:
+                return bool(value)
+        return None
+
     async def get_reply_message(self) -> Any:
         """Вернуть исходный reply в live Telethon или ``None`` офлайн."""
 
-        raw_message = getattr(self.raw, "message", None)
-        for source in (self.raw, raw_message):
+        for source in self._raw_sources():
             getter = getattr(source, "get_reply_message", None)
             if not callable(getter):
                 continue
@@ -106,10 +129,100 @@ class Message:
         return None
 
     @property
+    def client(self) -> Any:
+        """Telethon-compatible ``event.client``.
+
+        Native/core-style modules receive the same normalized event as MCUB
+        modules.  They nevertheless legitimately use ``event.client`` for
+        operations such as ``send_file``.  In production prefer the exact
+        client attached to the raw Telethon event; the transport client is the
+        deterministic offline fallback used by setup-style modules as well.
+        """
+
+        for source in self._raw_sources():
+            try:
+                client = getattr(source, "client", None)
+            except Exception:  # pragma: no cover - foreign event descriptors
+                continue
+            if client is not None:
+                return client
+        return getattr(self.transport, "client", None) if self.transport is not None else None
+
+    @property
+    def is_group(self) -> bool:
+        """Whether this event belongs to a basic group or a megagroup."""
+
+        flag = self._raw_flag("is_group")
+        if flag is not None:
+            return flag
+        # Telethon's normalized IDs are negative for group/channel peers.  A
+        # raw event always wins above; this fallback makes offline smoke events
+        # useful without pretending that an ordinary private chat is a group.
+        return self.chat_id < 0
+
+    @property
+    def is_private(self) -> bool:
+        """Telethon-compatible private-chat predicate."""
+
+        flag = self._raw_flag("is_private")
+        if flag is not None:
+            return flag
+        return self.chat_id > 0
+
+    @property
+    def is_channel(self) -> bool:
+        """Telethon-compatible channel predicate when available."""
+
+        flag = self._raw_flag("is_channel")
+        if flag is not None:
+            return flag
+        # ``-100…`` is Telegram's marked channel/supergroup ID range.  This is
+        # only an offline approximation; raw Telethon metadata takes priority.
+        return self.chat_id <= -100_000_000_000
+
+    @property
     def sender(self) -> Any:
         """telethon-совместимость: event.sender (если raw-событие даёт его)."""
         raw_message = getattr(self.raw, "message", None)
         return getattr(self.raw, "sender", None) or getattr(raw_message, "sender", None)
+
+    @property
+    def mentioned(self) -> bool:
+        """Whether Telegram marked this message as mentioning the account."""
+
+        flag = self._raw_flag("mentioned")
+        return bool(flag)
+
+    async def _raw_getter(self, name: str) -> Any:
+        """Call a Telethon getter on the raw event/message when available."""
+
+        for source in self._raw_sources():
+            getter = getattr(source, name, None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return None
+
+    async def get_chat(self) -> Any:
+        """Telethon-compatible lazy chat lookup."""
+
+        result = await self._raw_getter("get_chat")
+        if result is not None:
+            return result
+        for source in self._raw_sources():
+            chat = getattr(source, "chat", None)
+            if chat is not None:
+                return chat
+        return None
+
+    async def get_sender(self) -> Any:
+        """Telethon-compatible lazy sender lookup."""
+
+        result = await self._raw_getter("get_sender")
+        return result if result is not None else self.sender
 
     @property
     def is_reply(self) -> bool:
@@ -173,11 +286,26 @@ class Transport:
 
 
 class _StubClient:
-    """Минимальный клиент для setup(client) в офлайн-сборке: только копилка
-    обработчиков, без сети."""
+    """Small offline stand-in for a Telethon client.
 
-    def __init__(self) -> None:
+    Setup-style modules register event handlers on it, while core-style
+    handlers can access it through ``event.client``.  It deliberately keeps
+    network/RPC operations out of offline tests, but maps ordinary message and
+    file sends to :class:`NullTransport` so presentation-only commands can be
+    smoke-tested faithfully.
+    """
+
+    def __init__(self, transport: "NullTransport") -> None:
+        self._transport = transport
         self.handlers: List[Any] = []
+
+    def _chat_id(self, entity: Any) -> int:
+        if entity in (None, "me", "self"):
+            return self._transport.me_id
+        try:
+            return int(entity)
+        except (TypeError, ValueError):
+            return self._transport.me_id
 
     def add_event_handler(self, fn: Any, event: Any = None) -> Any:
         self.handlers.append((fn, event))
@@ -192,11 +320,34 @@ class _StubClient:
 
     async def get_me(self) -> Any:
         class _Me:
-            id = 1000
             username = None
             first_name = "Hydra"
 
-        return _Me()
+        me = _Me()
+        me.id = self._transport.me_id
+        return me
+
+    async def send_message(self, entity: Any, text: str, **kw: Any) -> Message:
+        return await self._transport.send(self._chat_id(entity), text, **kw)
+
+    async def send_file(self, entity: Any, file: Any, **kw: Any) -> Message:
+        # NullTransport has no media store.  Preserve the visible caption so a
+        # UI command such as `.start` is still meaningfully testable.
+        caption = kw.pop("caption", None)
+        text = str(caption if caption is not None else file)
+        return await self._transport.send(self._chat_id(entity), text, **kw)
+
+    async def edit_message(self, entity: Any, message: Any, text: str, **kw: Any) -> Message:
+        message_id = message if isinstance(message, int) else getattr(message, "id", 0)
+        return await self._transport.edit(self._chat_id(entity), int(message_id or 0), text, **kw)
+
+    async def delete_messages(self, entity: Any, messages: Any, **kw: Any) -> list[Any]:
+        ids = messages if isinstance(messages, (list, tuple, set)) else [messages]
+        for message in ids:
+            message_id = message if isinstance(message, int) else getattr(message, "id", 0)
+            if message_id:
+                await self._transport.delete(self._chat_id(entity), int(message_id))
+        return []
 
 
 class NullTransport(Transport):
@@ -230,7 +381,7 @@ class NullTransport(Transport):
     def client(self) -> Any:
         """Stub-клиент для setup(client)-модулей в офлайн-режиме."""
         if getattr(self, "_stub_client", None) is None:
-            self._stub_client = _StubClient()
+            self._stub_client = _StubClient(self)
         return self._stub_client
 
     async def send(self, chat_id: int, text: str, **kw: Any) -> Message:
@@ -248,11 +399,17 @@ class NullTransport(Transport):
         return msg
 
     async def edit(self, chat_id: int, message_id: int, text: str, **kw: Any) -> Message:
+        buttons_supplied = "buttons" in kw
+        buttons = kw.pop("buttons", None)
         for m in self.sent:
             if m.chat_id == chat_id and m.message_id == message_id:
                 m.text = text
+                if buttons_supplied:
+                    m.buttons = buttons
                 self._decorate_menu(m)
                 return m
+        if buttons_supplied:
+            kw["buttons"] = buttons
         return await self.send(chat_id, text, **kw)
 
     def _decorate_menu(self, msg: "Message") -> None:
@@ -294,6 +451,7 @@ class NullTransport(Transport):
         text: str,
         sender_id: Optional[int] = None,
         outgoing: bool = False,
+        raw: Any = None,
     ) -> Message:
         """Симулировать входящее сообщение и раздать его подписчикам."""
         msg = Message(
@@ -302,6 +460,7 @@ class NullTransport(Transport):
             text=text,
             outgoing=outgoing,
             message_id=next(self._ids),
+            raw=raw,
             transport=self,
         )
         for rec in list(self._subs):
