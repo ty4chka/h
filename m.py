@@ -1841,7 +1841,10 @@ def get_client_kwargs(session_name, proxy_enabled=False):
     }
     if proxy_enabled and hasattr(config, 'PROXY') and config.PROXY:
         kwargs["proxy"] = (config.PROXY["addr"], config.PROXY["port"], config.PROXY["secret"])
-        kwargs["connection"] = connection.ConnectionTcpMTProxyIntermediate
+        # Telethon recommends randomized intermediate for MTProto proxies.
+        # It also provides the best standard-Telethon compatibility with
+        # modern ``dd``/``ee`` secrets from t.me/proxy links.
+        kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
     return kwargs
 
 

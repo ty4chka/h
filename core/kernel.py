@@ -70,7 +70,7 @@ class HydraKernel:
         if proxy:
             from telethon import connection
             client_kwargs["proxy"] = (proxy["addr"], proxy["port"], proxy.get("secret", ""))
-            client_kwargs["connection"] = connection.ConnectionTcpMTProxyIntermediate
+            client_kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
 
         # Unified Telegram Client
         self.client = UnifiedTelegramClient(

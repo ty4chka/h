@@ -64,6 +64,39 @@ sh tools/build_go.sh
 
 Зелёный вывод = ядро + все цели + набор модулей работают.
 
+## 🌐 MTProto-прокси
+
+Hydra принимает MTProto-прокси из `t.me/proxy` и использует для него
+рекомендованный Telethon transport `ConnectionTcpMTProxyRandomizedIntermediate`.
+Скопируйте `data/config.example.json` в локальный `data/config.json` (он
+игнорируется Git) и заполните поля:
+
+```json
+{
+  "proxy_enabled": true,
+  "proxy_addr": "proxy.example.org",
+  "proxy_port": 443,
+  "proxy_secret": "secret-from-t-me-proxy-link"
+}
+```
+
+Либо задайте те же значения только для одного запуска через
+`HYDRA_PROXY_ENABLED`, `HYDRA_PROXY_ADDR`, `HYDRA_PROXY_PORT` и
+`HYDRA_PROXY_SECRET`. Перезапустите Hydra после изменения. Не публикуйте
+`api_hash`, session-файлы или proxy secret. Если провайдер принимает только
+строгий FakeTLS (`ee…`) и разрывает соединение, запросите у него обычный или
+`dd…` MTProto-secret: стандартный Telethon не реализует полный FakeTLS
+handshake.
+
+## 🧩 Установка MCUB-модуля
+
+Запустите `.mload <raw-URL-на-py-файл>` или ответьте `.mload` на сообщение с
+исходником/`.py`-файлом. Исходник проходит scanner, сохраняется в
+`modules/mcub_mods/`, загружается сразу и будет автоматически загружен после
+перезапуска. Управление: `.mls`, `.mhelp <модуль>`, `.mcfg <модуль>` и
+`.mun <модуль> [--del]`. Поддерживаются MCUB-совместимые модули; сторонние
+модули всё ещё могут требовать свои API-ключи или Python-зависимости.
+
 ## 📦 Модуль за 30 секунд
 
 ```python

@@ -44,7 +44,7 @@ def get_client(
     if proxy:
         from telethon import connection
         kwargs["proxy"] = (proxy["addr"], proxy["port"], proxy.get("secret", ""))
-        kwargs["connection"] = connection.ConnectionTcpMTProxyIntermediate
+        kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
 
     client = UnifiedTelegramClient(
         session_name,
