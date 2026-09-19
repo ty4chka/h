@@ -218,6 +218,74 @@ async def check_telethon_both_direction_subscription() -> None:
         transport_module.events = old_events
 
 
+async def check_live_compatibility_shims() -> None:
+    """L2 event/conversation shims keep live MCUB modules on Telethon stable."""
+
+    import types
+
+    from hydra_kernel.api.inline import CallbackQueryEvent
+    from hydra_kernel.compat.base import ClientProxy
+    from hydra_kernel.kernel.transport import Message
+
+    class RawMessage:
+        sender = "sender"
+        reply_to = types.SimpleNamespace(reply_to_msg_id=71)
+
+        async def get_reply_message(self):
+            return "reply"
+
+    event = types.SimpleNamespace(message=RawMessage())
+    message = Message(chat_id=500, sender_id=1000, text=".man", message_id=77, raw=event)
+    assert message.id == 77
+    assert message.reply_to_msg_id == 71 and message.is_reply
+    assert message.sender == "sender"
+    assert await message.get_reply_message() == "reply"
+    assert CallbackQueryEvent("close", 1000, chat_id=500).input_chat == 500
+
+    class NativeConversation:
+        def __init__(self):
+            self._pending_responses = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get_response(self):
+            future = asyncio.get_running_loop().create_future()
+            self._pending_responses["late"] = future
+            return await future
+
+    class NativeClient:
+        def __init__(self):
+            self.conversation_obj = NativeConversation()
+
+        async def get_me(self):
+            return types.SimpleNamespace(id=1000, username="real_user")
+
+        def conversation(self, *_args, **_kwargs):
+            return self.conversation_obj
+
+    class LiveTransport:
+        me_id = 1000
+
+        def __init__(self):
+            self.client = NativeClient()
+
+    transport = LiveTransport()
+    client = ClientProxy(transport)
+    assert (await client.get_me()).username == "real_user"
+    async with client.conversation("@example_bot") as conversation:
+        try:
+            await asyncio.wait_for(conversation.get_response(), timeout=0.001)
+        except asyncio.TimeoutError:
+            pass
+        assert not transport.client.conversation_obj._pending_responses, (
+            "cancelled Telethon waiter was left for a late update"
+        )
+
+
 # ---------------------------------------------------------------- smoke
 HYDRA_SRC = """
 from hydra_kernel.api import ModuleBase, command, inline_handler, callback
@@ -531,6 +599,23 @@ async def owned_mcub_modules_suite() -> None:
         names = {record.name for record in records}
         assert {"openagent_mcub_repo", "readfile_mcub_repo"} <= names, names
         assert "vector_mcub_repo" not in names, "идентичный Vector загрузился второй раз"
+
+        # man — реальный class-style MCUB: normalized event.reply_to_msg_id,
+        # kernel._loader facade и programmatic inline form должны работать.
+        before = len(h.transport.sent)
+        await h.transport.inject(500, ".man", sender_id=1000, outgoing=True)
+        forms = h.transport.sent[before:]
+        assert len(forms) == 1, f".man отправил неожиданные ответы: {[m.text for m in forms]}"
+        assert "OpenAgent" in forms[0].text and forms[0].buttons, ".man не собрал форму модулей"
+        before = len(h.transport.sent)
+        await h.transport.inject(500, ".man OpenAgent", sender_id=1000, outgoing=True)
+        assert any("OpenAgent" in message.text for message in h.transport.sent[before:]), \
+            ".man OpenAgent не показал карточку модуля"
+        close_token = forms[0].buttons[-1][0]["data"]
+        await h.transport.inject_callback(
+            close_token, sender_id=1000, chat_id=500, message_id=forms[0].message_id
+        )
+        assert forms[0] not in h.transport.sent, ".man close callback не удалил форму"
     finally:
         for name in list(h.registry.names()):
             await h.unload_module(name)
@@ -732,6 +817,13 @@ async def main() -> int:
         print(fail(f"Telethon transport: {type(e).__name__}: {e}"))
         failures += 1
 
+    try:
+        await check_live_compatibility_shims()
+        print(ok("live compat: reply_to/id и cleanup отменённого Telethon conversation"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"live compat: {type(e).__name__}: {e}"))
+        failures += 1
+
     # демонстрация блокировки небезопасного модуля
     hydra = Hydra()
     try:
@@ -764,7 +856,7 @@ async def main() -> int:
 
     try:
         await owned_mcub_modules_suite()
-        print(ok("собственные modules/mcub_mods/: OpenAgent и остальные MCUB-модули автозагружаются"))
+        print(ok("собственные modules/mcub_mods/: автозагрузка, .man и карточка OpenAgent работают"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"owned MCUB modules: {type(e).__name__}: {e}"))
         failures += 1

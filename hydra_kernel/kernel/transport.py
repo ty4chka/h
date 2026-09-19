@@ -59,22 +59,66 @@ class Message:
         return self.chat_id
 
     @property
+    def id(self) -> int:
+        """Telethon-совместимый алиас ``Message.id``."""
+        return self.message_id
+
+    @property
+    def reply_to_msg_id(self) -> Any:
+        """ID сообщения, на которое отвечает команда, если оно есть.
+
+        L2-адаптер передаёт модулям нормализованный ``Message``, тогда как
+        исходные MCUB-модули ожидают поле Telethon ``reply_to_msg_id``. У
+        ``NewMessage.Event`` оно может жить как на самом событии, так и на
+        вложенном ``event.message`` — поддерживаем оба варианта.
+        """
+
+        raw_message = getattr(self.raw, "message", None)
+        for source in (self.raw, raw_message):
+            if source is None:
+                continue
+            value = getattr(source, "reply_to_msg_id", None)
+            if value is not None:
+                return value
+            reply_to = getattr(source, "reply_to", None)
+            value = getattr(reply_to, "reply_to_msg_id", None)
+            if value is not None:
+                return value
+        return None
+
+    @property
     def entities(self) -> list[Any]:
         """NullTransport не парсит разметку, но Hikka ждёт iterable."""
         return []
 
     async def get_reply_message(self) -> Any:
-        """В офлайн-сообщении нет цепочки reply; API остаётся совместимым."""
+        """Вернуть исходный reply в live Telethon или ``None`` офлайн."""
+
+        raw_message = getattr(self.raw, "message", None)
+        for source in (self.raw, raw_message):
+            getter = getattr(source, "get_reply_message", None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
         return None
 
     @property
     def sender(self) -> Any:
         """telethon-совместимость: event.sender (если raw-событие даёт его)."""
-        return getattr(self.raw, "sender", None)
+        raw_message = getattr(self.raw, "message", None)
+        return getattr(self.raw, "sender", None) or getattr(raw_message, "sender", None)
 
     @property
     def is_reply(self) -> bool:
-        return bool(getattr(self.raw, "is_reply", False))
+        raw_message = getattr(self.raw, "message", None)
+        return bool(
+            getattr(self.raw, "is_reply", False)
+            or getattr(raw_message, "is_reply", False)
+            or self.reply_to_msg_id is not None
+        )
 
     @property
     def out(self) -> bool:

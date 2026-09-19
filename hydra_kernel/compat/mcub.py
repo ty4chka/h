@@ -20,6 +20,7 @@ import re
 import time
 import types
 import uuid
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 from .base import ClientProxy, CompatAdapter
@@ -177,6 +178,83 @@ class ConversationShim:
 
     async def get_response(self, timeout: float = 30) -> Any:  # pragma: no cover
         raise NotImplementedError("conversation.get_response требует живой транспорт")
+
+
+class _McubLoaderView:
+    """Маленькая совместимая поверхность ``kernel._loader`` для MCUB.
+
+    Настоящий MCUB ``man`` использует её для списка команд и метаданных.
+    Hydra хранит эти сведения иначе, поэтому адаптируем реестр, не запуская
+    второй старый движок.
+    """
+
+    def __init__(self, kernel: "McubKernelInterface") -> None:
+        self.kernel = kernel
+
+    def _names_for(self, module_name: str) -> set[str]:
+        names = {str(module_name)}
+        module = self.kernel.lookup_module(module_name)
+        if module is None:
+            return names
+        names.add(str(getattr(module, "name", "")))
+        names.add(str(getattr(type(module), "__module__", "")))
+        for name, instance in self.kernel._class_module_instances.items():
+            if instance is module:
+                names.add(str(name))
+        names.discard("")
+        return names
+
+    @staticmethod
+    def pick_localized_text(value: Any, lang: str = "ru", fallback: str = "") -> str:
+        if isinstance(value, dict):
+            return str(value.get(lang) or value.get("ru") or value.get("en") or fallback)
+        if isinstance(value, str) and value.strip():
+            return value
+        return fallback
+
+    def get_module_path(self, module_name: str) -> Optional[str]:
+        """Найти owned source по имени без предположения о cwd пользователя."""
+
+        here = Path(__file__).resolve().parents[2]
+        candidates = self._names_for(module_name)
+        for root in (here / "modules" / "mcub_mods", here / "modules", here / "extras" / "mcub_pack"):
+            for name in candidates:
+                source = root / f"{name}.py"
+                if source.is_file():
+                    return str(source)
+        return None
+
+    def get_module_commands(self, module_name: str, lang: str = "ru") -> tuple[list[str], dict, dict]:
+        names = self._names_for(module_name)
+        commands = [
+            command
+            for command, owner in self.kernel.command_owners.items()
+            if str(owner) in names
+        ]
+        aliases_info: dict[str, list[str]] = {}
+        for alias, command in self.kernel.aliases.items():
+            if command in commands:
+                aliases_info.setdefault(command, []).append(alias)
+
+        descriptions: dict[str, str] = {}
+        for command in commands:
+            handler = self.kernel.h.command_handlers.get(command)
+            original = getattr(handler, "__original__", handler)
+            for pattern, meta in getattr(original, "_mcub_commands", ()):
+                if str(pattern) != command:
+                    continue
+                doc = meta.get("doc") if isinstance(meta, dict) else None
+                descriptions[command] = self.pick_localized_text(
+                    doc,
+                    lang,
+                    (meta.get(f"doc_{lang}") or meta.get("doc_ru") or meta.get("doc_en") or "")
+                    if isinstance(meta, dict)
+                    else "",
+                )
+                break
+            else:
+                descriptions[command] = ""
+        return commands, aliases_info, descriptions
 
 
 class KernelRegister:
@@ -348,6 +426,7 @@ class McubKernelInterface:
         self.scheduler = None
         self.MODULES_DIR = "modules"
         self.MODULES_LOADED_DIR = "modules_loaded"
+        self.load_kernel = "full"
         self.Colors = Colors
         self.cache = TTLCache()
         self.version_manager = VersionManager(hydra)
@@ -358,6 +437,8 @@ class McubKernelInterface:
         self._module_config_schemas: dict[str, Any] = {}
         self._user_emoji: dict[Any, Any] = {}
         self.command_owners: dict[str, str] = {}
+        self._inline_owners: dict[str, str] = {}
+        self._loader = _McubLoaderView(self)
         self.log_chat_id = self.config.get("log_chat_id")
         self.register = KernelRegister(self)
         # kernel-уровневая фабрика кнопок (без привязки к модулю)
@@ -407,11 +488,39 @@ class McubKernelInterface:
     def _records(self) -> dict:
         return getattr(self.h.registry, "_records", {})
 
+    def get_module_inline_commands(self, module_name: str) -> list[tuple[str, None]]:
+        names = self._loader._names_for(module_name)
+        return [
+            (name, None)
+            for name, owner in self._inline_owners.items()
+            if str(owner) in names
+        ]
+
+    async def get_module_metadata(self, code: str) -> dict:
+        """Best-effort metadata extractor expected by MCUB's man module."""
+
+        metadata: dict[str, Any] = {}
+        version = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', code)
+        if version:
+            metadata["version"] = version.group(1).strip()
+        author = re.search(r"#\s*meta\s+developer\s*:\s*(.+)", code, re.IGNORECASE)
+        if author:
+            metadata["author"] = author.group(1).strip()
+        name = re.search(r"#\s*meta\s+name\s*:\s*(.+)", code, re.IGNORECASE)
+        if name:
+            metadata["name"] = name.group(1).strip()
+        description = re.search(r'"""(.*?)"""', code, re.DOTALL)
+        if description and description.group(1).strip():
+            metadata["description"] = description.group(1).strip()[:200]
+        return metadata
+
     # -- команды / обработчики --
     def register_command(self, name: str, handler: Callable, aliases: Optional[List[str]] = None) -> None:
         prefix = self.h.prefix
         owner = getattr(getattr(handler, "__bound_instance__", None), "name", None)
-        owner = owner or getattr(getattr(handler, "__self__", None), "name", None) or "mcub"
+        owner = owner or getattr(getattr(handler, "__self__", None), "name", None)
+        original = getattr(handler, "__original__", handler)
+        owner = owner or getattr(original, "__module__", None) or "mcub"
         for cmd in [name, *(aliases or [])]:
             command_name = str(cmd)
             pattern = rf"(?i)^{re.escape(prefix)}{re.escape(command_name)}(?:\s|$)"
@@ -446,6 +555,8 @@ class McubKernelInterface:
         self._unsubs.append(self.h.transport.subscribe(wrapper, **options))
 
     def register_inline_handler(self, name: str, handler: Callable) -> None:
+        original = getattr(handler, "__original__", handler)
+        self._inline_owners[name] = str(getattr(original, "__module__", "mcub"))
         self.h.register_inline(name, handler)
 
     def register_callback_handler(self, prefix: str | bytes, handler: Callable) -> None:
@@ -453,8 +564,48 @@ class McubKernelInterface:
         self.h.register_callback(normalized, handler)
 
     # -- inline инструменты (как в MCUB-fork) --
-    async def inline_query_and_click(self, chat_id: int, query: str, *args: Any, **kw: Any) -> Tuple[bool, Optional[str]]:
-        return await self.h._on_inline(query, chat_id, None), None
+    async def inline_query_and_click(self, chat_id: int, query: str, *args: Any, **kw: Any) -> Tuple[bool, Any]:
+        """Локально выполнить inline handler и отрисовать его первый результат.
+
+        У обычного userbot-клиента нет своего CallbackQuery на команду ``.man``.
+        Старый MCUB использует inline-bot, а Hydra обеспечивает эквивалентную
+        текстовую форму с теми же callback-кнопками.
+        """
+
+        from ..api.inline import InlineQueryEvent
+
+        text = str(query or "").strip()
+        name = text.split(maxsplit=1)[0] if text else ""
+        handler = self.h.inline_handlers.get(name)
+        if handler is None:
+            return False, f"Inline handler '{name}' не найден"
+
+        event = InlineQueryEvent(
+            name=name,
+            query=text,
+            sender_id=self.h.transport.me_id,
+            transport=None,
+            raw=None,
+        )
+        try:
+            await handler(event)
+        except Exception as exc:  # noqa: BLE001 - API возвращает ошибку вызывающему модулю
+            return False, str(exc)
+        if not event.results:
+            return False, f"Inline handler '{name}' не вернул результатов"
+
+        result = event.results[0]
+        body = getattr(result, "text", None) or getattr(result, "body", None) or ""
+        if not body:
+            return False, f"Inline handler '{name}' вернул пустой результат"
+        send_kw: dict[str, Any] = {
+            "buttons": self._normalize_buttons(getattr(result, "buttons", None)),
+            "parse_mode": getattr(result, "parse_mode", "html"),
+        }
+        if kw.get("reply_to") is not None:
+            send_kw["reply_to"] = kw["reply_to"]
+        sent = await self.h.transport.send(int(chat_id), str(body), **send_kw)
+        return True, sent
 
     def _normalize_buttons(self, buttons: Any) -> Any:
         """telethon KeyboardInlineButton (data=uuid-токен) -> dict-кнопки ядра."""
