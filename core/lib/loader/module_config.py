@@ -681,6 +681,18 @@ class ModuleConfig:
         for key, value in mapping.items():
             self[key] = value
 
+    def set_on_change(self, key: str, callback: Callable | None):
+        """Назначить callback изменения значения (API MCUB-fork).
+
+        Возвращаем callback, чтобы метод можно было использовать и как
+        регистрационный helper. Ошибка имени остаётся явной, как у
+        ``__getitem__``/``__setitem__``.
+        """
+        if key not in self._values:
+            raise KeyError(f"Unknown config key: {key}")
+        self._values[key].on_change = callback
+        return callback
+
     def to_dict(self) -> dict[str, Any]:
         """Return current config as plain dict (for saving)."""
         data = {key: cv.to_storage() for key, cv in self._values.items()}

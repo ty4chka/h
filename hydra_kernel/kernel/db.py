@@ -33,6 +33,18 @@ class MemoryDB:
         async with self._lock:
             return list(self._data.get(ns, {}).keys())
 
+    # Имена старого MCUB DB manager. Они намеренно являются тонкими alias-ами
+    # L0 API, чтобы class-style модули могли использовать ``await self.db``
+    # так же, как в исходном MCUB-ядре.
+    async def db_get(self, module: str, key: str, default: Any = None) -> Any:
+        return await self.get(module, key, default)
+
+    async def db_set(self, module: str, key: str, value: Any) -> None:
+        await self.set(module, key, value)
+
+    async def db_delete(self, module: str, key: str) -> None:
+        await self.delete(module, key)
+
     # синхронный фасад (нужен Heroku-модулям: self._db.set(...) без await)
     def get_sync(self, ns: str, key: str, default: Any = None) -> Any:
         return self._data.get(ns, {}).get(key, default)

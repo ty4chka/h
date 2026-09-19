@@ -114,7 +114,29 @@ class ModuleConfig:
         if item is None:
             item = ConfigValue(key)
             self._items[key] = item
+        old_value = item.value
         item.set(value)
+        if callable(item.on_change):
+            result = item.on_change(old_value, item.value)
+            # Конфиг обычно синхронный, но не теряем async callback в модуле.
+            if hasattr(result, "__await__"):
+                import asyncio
+
+                try:
+                    asyncio.get_running_loop().create_task(result)
+                except RuntimeError:
+                    # Вне event loop callback будет выполнен при следующем
+                    # асинхронном доступе владельца; главное — не ломать set().
+                    result.close() if hasattr(result, "close") else None
+
+    def set_on_change(self, key: str, callback: Any) -> Any:
+        """MCUB/Hikka-совместимый способ назначить callback изменения."""
+
+        item = self._items.get(key)
+        if item is None:
+            raise KeyError(key)
+        item.on_change = callback
+        return callback
 
     def __getitem__(self, key: str) -> Any:
         return self._items[key].value

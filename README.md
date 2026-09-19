@@ -7,7 +7,7 @@
 Dragon**. Один процесс — пять экосистем модулей.
 
 ```
-L4  modules/             твои модули (ping, terminal, translations, …)
+L4  modules/ + mcub_mods/ твои модули (Hydra и сохранённые MCUB-модули)
 L3  pkg/                 loader · registry · resolver · manifest · scanner
 L2  compat/              MCUB · Hikka · Heroku · Dragon · legacy Hydra
 L1  api/                 ModuleBase · decorators · permissions · inline · lang
@@ -42,7 +42,10 @@ L0  kernel/              transport · db · runtime · logging · gobridge(Go)
   (`tools/build_native.py`), импортёр подхватывает их автоматически
 - **Безопасность**: AST-scanner блокирует `exec/eval/os.system/subprocess`
   до выполнения; `owner_only`-права
-- **Офлайн-сборка**: ядро собирается и проходит smoke-тесты без telethon и сети
+- **Автозагрузка своих MCUB-модулей**: `modules/mcub_mods/*.py` (включая
+  OpenAgent) стартуют вместе с обычными модулями; идентичные копии не запускаются дважды
+- **Офлайн-сборка**: ядро собирается и проходит smoke-тесты без telethon и сети;
+  на Termux/Android неподдерживаемый `psutil` заменяется безопасным fallback
 - **Пакетная система**: манифесты, зависимости (топосорт), реестр, жизненный цикл
 
 ## 🚀 Быстрый старт
@@ -60,6 +63,38 @@ sh tools/build_go.sh
 ```
 
 Зелёный вывод = ядро + все цели + набор модулей работают.
+
+## 🌐 MTProto-прокси
+
+Hydra принимает MTProto-прокси из `t.me/proxy`: обычные/`dd…` секреты идут
+через рекомендованный Telethon transport `ConnectionTcpMTProxyRandomizedIntermediate`,
+а `ee…` FakeTLS-секреты автоматически проходят нативный FakeTLS handshake.
+Скопируйте `data/config.example.json` в локальный `data/config.json` (он
+игнорируется Git) и заполните поля:
+
+```json
+{
+  "proxy_enabled": true,
+  "proxy_addr": "proxy.example.org",
+  "proxy_port": 443,
+  "proxy_secret": "secret-from-t-me-proxy-link"
+}
+```
+
+Либо задайте те же значения только для одного запуска через
+`HYDRA_PROXY_ENABLED`, `HYDRA_PROXY_ADDR`, `HYDRA_PROXY_PORT` и
+`HYDRA_PROXY_SECRET`. Перезапустите Hydra после изменения. Не публикуйте
+`api_hash`, session-файлы или proxy secret. Для `ee…` не убирайте префикс
+или домен из секрета: Hydra использует их для проверки FakeTLS-соединения.
+
+## 🧩 Установка MCUB-модуля
+
+Запустите `.mload <raw-URL-на-py-файл>` или ответьте `.mload` на сообщение с
+исходником/`.py`-файлом. Исходник проходит scanner, сохраняется в
+`modules/mcub_mods/`, загружается сразу и будет автоматически загружен после
+перезапуска. Управление: `.mls`, `.mhelp <модуль>`, `.mcfg <модуль>` и
+`.mun <модуль> [--del]`. Поддерживаются MCUB-совместимые модули; сторонние
+модули всё ещё могут требовать свои API-ключи или Python-зависимости.
 
 ## 📦 Модуль за 30 секунд
 

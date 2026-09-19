@@ -7,6 +7,7 @@ import logging
 from typing import Optional
 
 from .lib.telethon_mcub import UnifiedTelegramClient
+from hydra_kernel.mtproxy import connection_class_for_secret
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,9 @@ def get_client(
     }
 
     if proxy:
-        from telethon import connection
-        kwargs["proxy"] = (proxy["addr"], proxy["port"], proxy.get("secret", ""))
-        kwargs["connection"] = connection.ConnectionTcpMTProxyIntermediate
+        secret = proxy.get("secret", "")
+        kwargs["proxy"] = (proxy["addr"], proxy["port"], secret)
+        kwargs["connection"] = connection_class_for_secret(secret)
 
     client = UnifiedTelegramClient(
         session_name,

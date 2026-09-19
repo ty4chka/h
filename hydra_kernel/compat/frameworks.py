@@ -273,6 +273,11 @@ class HikkaLikeAdapter(CompatAdapter):
         import sys as _sys
 
         try:
+            # Используем реальный Telethon, а при офлайн-сборке — совместимый
+            # shim. Не полагаемся на то, что атрибут ``tl`` уже материализован.
+            from .offline_deps import ensure_offline_dependencies
+
+            ensure_offline_dependencies()
             tel = importlib.import_module("telethon")
             for dotted, mod in (
                 ("hikkatl", tel),
@@ -284,7 +289,8 @@ class HikkaLikeAdapter(CompatAdapter):
                 ("hikkatl.errors", tel.errors),
             ):
                 _sys.modules.setdefault(dotted, mod)
-        except ImportError:
+        except (ImportError, AttributeError):
+            # Адаптер не требует Telethon для простых Hikka/Heroku-модулей.
             pass
 
         async def edit_or_reply(event: Any, text: str, **kw: Any) -> Any:
