@@ -73,6 +73,13 @@ def compile_trees() -> int:
         for py in sorted(tree.glob("*.py")):
             py_compile.compile(str(py), doraise=True)
             total += 1
+    # Пользовательские MCUB-модули из этой папки теперь грузятся диспетчером
+    # modules/mcub.py, поэтому синтаксис проверяется тем же build-прогоном.
+    mcub_tree = tree / "mcub_mods"
+    if mcub_tree.exists():
+        for py in sorted(mcub_tree.glob("*.py")):
+            py_compile.compile(str(py), doraise=True)
+            total += 1
     return total
 
 
@@ -100,6 +107,36 @@ def check_scanner() -> None:
     rules = {f.rule for f in findings if f.severity == "critical"}
     assert {"os.system", "exec", "subprocess"} <= rules, rules
     assert scan_source("x = 1\n") == []
+
+
+def check_android_optional_dependency_fallback() -> None:
+    """Termux psutil может быть установлен, но падать при import на Android."""
+
+    import sys as _sys
+    import types as _types
+
+    from hydra_kernel.compat import offline_deps
+
+    probe = "_hydra_android_optional_probe"
+    prior = _sys.modules.get(probe)
+    _sys.modules[probe] = _types.ModuleType(probe)  # имитируем partial import
+    original_import = offline_deps.importlib.import_module
+
+    def android_failure(name, *args, **kwargs):
+        if name == probe:
+            raise NotImplementedError("platform android is not supported")
+        return original_import(name, *args, **kwargs)
+
+    offline_deps.importlib.import_module = android_failure
+    try:
+        assert offline_deps._import_or_none(probe) is None
+        assert probe not in _sys.modules, "partial Android import не был очищен"
+    finally:
+        offline_deps.importlib.import_module = original_import
+        if prior is not None:
+            _sys.modules[probe] = prior
+        else:
+            _sys.modules.pop(probe, None)
 
 
 # ---------------------------------------------------------------- smoke
@@ -390,6 +427,37 @@ async def modules_suite() -> None:
     assert any("🌐" in m.text for m in h.transport.sent), "родная .mylang не ответила"
 
 
+async def owned_mcub_modules_suite() -> None:
+    """Диспетчер m.py подхватывает сохранённые modules/mcub_mods/.
+
+    Проверяем именно production-путь, а не отдельный ``load_dir``: OpenAgent
+    и ReadFile должны попасть в единый runtime, а идентичная копия Vector не
+    должна зарегистрировать команды второй раз.
+    """
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "hydra_owned_mcub_dispatcher", ROOT / "modules" / "mcub.py"
+    )
+    assert spec and spec.loader, "не удалось открыть modules/mcub.py"
+    dispatcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dispatcher)
+
+    h = Hydra(owner_id=1000)
+    await h.start()
+    try:
+        records, errors = await dispatcher._load_owned_modules(h)
+        assert not errors, f"ошибки загрузки собственных MCUB-модулей: {errors}"
+        names = {record.name for record in records}
+        assert {"openagent_mcub_repo", "readfile_mcub_repo"} <= names, names
+        assert "vector_mcub_repo" not in names, "идентичный Vector загрузился второй раз"
+    finally:
+        for name in list(h.registry.names()):
+            await h.unload_module(name)
+        await h.stop()
+
+
 NATIVE_AUDIT = [
     (".mylang", "lang"), (".languages", "lang"), (".lang ru", "lang"),
     (".start", "start"), (".serverinfo", "ServerInfo"), (".sysinfo", "ServerInfo"),
@@ -571,6 +639,13 @@ async def main() -> int:
         print(fail(f"scanner: {e}"))
         failures += 1
 
+    try:
+        check_android_optional_dependency_fallback()
+        print(ok("offline deps: Android/Termux fallback для неподдерживаемого psutil"))
+    except AssertionError as e:
+        print(fail(f"offline deps: {e}"))
+        failures += 1
+
     # демонстрация блокировки небезопасного модуля
     hydra = Hydra()
     try:
@@ -596,9 +671,16 @@ async def main() -> int:
 
     try:
         await modules_suite()
-        print(ok("родные modules/ под единым движком: 10 модулей, 0 ошибок, .mylang отвечает"))
+        print(ok("родные modules/ под единым движком: 11 модулей, 0 ошибок, .mylang отвечает"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"modules suite: {type(e).__name__}: {e}"))
+        failures += 1
+
+    try:
+        await owned_mcub_modules_suite()
+        print(ok("собственные modules/mcub_mods/: OpenAgent и остальные MCUB-модули автозагружаются"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"owned MCUB modules: {type(e).__name__}: {e}"))
         failures += 1
 
     try:

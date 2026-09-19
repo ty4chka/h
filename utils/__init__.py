@@ -11,6 +11,8 @@ from utils.misc import (
     resolve_placeholders,
     resolve_media_placeholders,
     edit_or_reply,
+    answer,
+    get_args_raw,
     rate_limit,
     get_start_time,
     set_start_time,

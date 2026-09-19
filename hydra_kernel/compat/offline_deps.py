@@ -31,12 +31,38 @@ def _is_missing_root(exc: ModuleNotFoundError, root: str) -> bool:
     return exc.name in (None, root)
 
 
+def _discard_partial_import(root: str) -> None:
+    """Удалить частично импортированный optional package из ``sys.modules``."""
+
+    for name in tuple(sys.modules):
+        if name == root or name.startswith(f"{root}."):
+            sys.modules.pop(name, None)
+
+
+def _is_unsupported_platform_error(exc: BaseException) -> bool:
+    """Распознать известный сбой optional dependency на Termux/Android.
+
+    Например, некоторые сборки psutil существуют в site-packages, но при
+    импорте сами выбрасывают ``NotImplementedError('platform android is not
+    supported')``. Для compatibility runtime это эквивалент отсутствующей
+    необязательной зависимости: вместо падения всех модулей ставим shim.
+    """
+
+    message = str(exc).lower()
+    return "platform" in message and ("not supported" in message or "unsupported" in message)
+
+
 def _import_or_none(root: str) -> types.ModuleType | None:
     try:
         return importlib.import_module(root)
     except ModuleNotFoundError as exc:
         if not _is_missing_root(exc, root):
             raise
+        return None
+    except (ImportError, NotImplementedError, RuntimeError) as exc:
+        if not _is_unsupported_platform_error(exc):
+            raise
+        _discard_partial_import(root)
         return None
 
 
@@ -179,7 +205,7 @@ def _install_telethon() -> None:
     tl.types = types_mod
     tl.functions = functions_mod
 
-    for part in ("account", "channels", "contacts", "messages", "photos", "stories"):
+    for part in ("account", "channels", "contacts", "messages", "photos", "stories", "users"):
         child = _put_module(f"telethon.tl.functions.{part}")
         _dynamic_types(child, base=TLRequest)
         setattr(functions_mod, part, child)
@@ -282,15 +308,20 @@ def _install_aiohttp() -> None:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.args = args
             self.kwargs = kwargs
+            self._closed = False
+
+        @property
+        def closed(self) -> bool:
+            return self._closed
 
         async def __aenter__(self) -> "ClientSession":
             return self
 
         async def __aexit__(self, *args: Any) -> None:
-            return None
+            await self.close()
 
         async def close(self) -> None:
-            return None
+            self._closed = True
 
         def get(self, *args: Any, **kwargs: Any) -> _Response:
             return _Response()

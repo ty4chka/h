@@ -7,7 +7,7 @@
 Dragon**. Один процесс — пять экосистем модулей.
 
 ```
-L4  modules/             твои модули (ping, terminal, translations, …)
+L4  modules/ + mcub_mods/ твои модули (Hydra и сохранённые MCUB-модули)
 L3  pkg/                 loader · registry · resolver · manifest · scanner
 L2  compat/              MCUB · Hikka · Heroku · Dragon · legacy Hydra
 L1  api/                 ModuleBase · decorators · permissions · inline · lang
@@ -42,7 +42,10 @@ L0  kernel/              transport · db · runtime · logging · gobridge(Go)
   (`tools/build_native.py`), импортёр подхватывает их автоматически
 - **Безопасность**: AST-scanner блокирует `exec/eval/os.system/subprocess`
   до выполнения; `owner_only`-права
-- **Офлайн-сборка**: ядро собирается и проходит smoke-тесты без telethon и сети
+- **Автозагрузка своих MCUB-модулей**: `modules/mcub_mods/*.py` (включая
+  OpenAgent) стартуют вместе с обычными модулями; идентичные копии не запускаются дважды
+- **Офлайн-сборка**: ядро собирается и проходит smoke-тесты без telethon и сети;
+  на Termux/Android неподдерживаемый `psutil` заменяется безопасным fallback
 - **Пакетная система**: манифесты, зависимости (топосорт), реестр, жизненный цикл
 
 ## 🚀 Быстрый старт

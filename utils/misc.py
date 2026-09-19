@@ -69,6 +69,27 @@ async def edit_or_reply(event, text: str, **kwargs):
     except Exception:
         return await event.reply(text, **kwargs)
 
+
+async def answer(event, text: str, **kwargs):
+    """MCUB-совместимый alias ``utils.answer``."""
+
+    kwargs.pop("as_html", None)
+    return await edit_or_reply(event, text, **kwargs)
+
+
+def get_args_raw(event) -> str:
+    """Вернуть текст после команды в стиле MCUB/Hikka ``utils.get_args_raw``."""
+
+    text = (
+        getattr(event, "raw_text", None)
+        or getattr(event, "text", None)
+        or getattr(event, "message", None)
+        or ""
+    )
+    parts = str(text).split(maxsplit=1)
+    return parts[1] if len(parts) > 1 else ""
+
+
 def rate_limit(limit: int = 20, period: int = 120):
     """Декоратор для ограничения использования команд"""
     def decorator(func):

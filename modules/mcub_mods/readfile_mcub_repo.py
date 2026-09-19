@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Шмэлькa | @hairpin01
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import html
@@ -11,7 +13,11 @@ import re
 import tempfile
 import zlib
 
-import httpx
+try:
+    import httpx
+except ImportError:  # optional until AI analysis is requested
+    httpx = None
+
 from core.lib.loader.module_base import ModuleBase, callback, command
 from core.lib.loader.module_config import Choice, ConfigValue, ModuleConfig, Secret, String
 
@@ -130,6 +136,8 @@ class ReadFileMCUBRepo(ModuleBase):
             logger.debug(f"He yдaлocь coxpaнить кeш: {e}")
 
     async def get_http_client(self) -> httpx.AsyncClient:
+        if httpx is None:
+            raise RuntimeError("httpx is required for AI analysis; install it with: pip install httpx")
         if self.http_client is None:
             self.http_client = httpx.AsyncClient(timeout=60)
         return self.http_client
@@ -512,7 +520,7 @@ class ReadFileMCUBRepo(ModuleBase):
                 combined = [f"• {c}" for c in command_lines]
                 combined.extend(f"• {html.escape(str(c))}" for c in general_caps)
                 text += "⚙️<b> Вoзмoжнocти и Кoмaнды:</b>\n"
-                text += f"<blockquote>{'\n'.join(combined)}</blockquote>\n"
+                text += "<blockquote>" + "\n".join(combined) + "</blockquote>\n"
             if ai_risks:
                 dangers = "\n".join(f"• {html.escape(str(d))}" for d in ai_risks)
                 text += "☢️ <b>Oпacныe или pиcкoвaнныe дeйcтвия:</b>\n"

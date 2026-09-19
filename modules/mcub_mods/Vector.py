@@ -473,7 +473,10 @@ class Vector(ModuleBase):
         self.kernel.store_module_config_schema(self.name, self.config)
         await self.kernel.save_module_config(self.name, self.config.to_dict())
 
-        asyncio.ensure_future(self._check_ban())
+        # NullTransport is used by the local/TUI compatibility runtime and has
+        # no Telegram or Vector network session to authenticate against.
+        if not getattr(self.kernel, "is_offline", False):
+            asyncio.ensure_future(self._check_ban())
 
     async def on_unload(self) -> None:
         LOG.info("Vector unloading")
