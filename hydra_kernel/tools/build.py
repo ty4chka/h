@@ -139,6 +139,85 @@ def check_android_optional_dependency_fallback() -> None:
             _sys.modules.pop(probe, None)
 
 
+async def check_telethon_both_direction_subscription() -> None:
+    """Реальный Telethon запрещает incoming=True вместе с outgoing=True.
+
+    NullTransport намеренно принимает оба флага, поэтому здесь подменяем только
+    API Telethon минимальным клиентом. Проверка ловит регрессию, при которой
+    живые команды загрузятся, но никогда не получат Telegram-событие.
+    """
+
+    import types
+
+    from hydra_kernel.kernel import transport as transport_module
+
+    class FakeNewMessage:
+        def __init__(self, **kwargs):
+            if kwargs.get("incoming") and kwargs.get("outgoing"):
+                raise ValueError("Telethon: incoming and outgoing are mutually exclusive")
+            self.kwargs = kwargs
+
+    class FakeEvents:
+        NewMessage = FakeNewMessage
+
+    class FakeClient:
+        def __init__(self):
+            self.handlers = []
+            self.removed = []
+
+        async def get_me(self):
+            return types.SimpleNamespace(id=1000)
+
+        def add_event_handler(self, callback, builder):
+            self.handlers.append((callback, builder))
+
+        def remove_event_handler(self, callback, builder):
+            self.removed.append((callback, builder))
+
+    old_have = transport_module._HAVE_TELETHON
+    old_events = transport_module.events
+    transport_module._HAVE_TELETHON = True
+    transport_module.events = FakeEvents
+    try:
+        client = FakeClient()
+        transport = transport_module.TelethonTransport(client=client)
+        await transport.start()
+        received = []
+
+        async def handler(message):
+            received.append(message)
+
+        unsubscribe = transport.subscribe(
+            handler, pattern=r"^\.ping$", incoming=True, outgoing=True
+        )
+        builders = [builder.kwargs for _, builder in client.handlers]
+        assert builders == [
+            {"pattern": r"^\.ping$", "incoming": True},
+            {"pattern": r"^\.ping$", "outgoing": True},
+        ], builders
+
+        # Неполный sender_id — частый вид собственного события Telethon.
+        outgoing = types.SimpleNamespace(
+            chat_id=500,
+            sender_id=None,
+            raw_text=".ping",
+            out=True,
+            message=types.SimpleNamespace(id=77),
+        )
+        await client.handlers[1][0](outgoing)
+        assert len(received) == 1
+        msg = received[0]
+        assert (msg.sender_id, msg.outgoing, msg.message_id, msg.text) == (
+            1000, True, 77, ".ping",
+        ), msg
+
+        unsubscribe()
+        assert len(client.removed) == 2, "отписка не сняла обе Telethon-подписки"
+    finally:
+        transport_module._HAVE_TELETHON = old_have
+        transport_module.events = old_events
+
+
 # ---------------------------------------------------------------- smoke
 HYDRA_SRC = """
 from hydra_kernel.api import ModuleBase, command, inline_handler, callback
@@ -644,6 +723,13 @@ async def main() -> int:
         print(ok("offline deps: Android/Termux fallback для неподдерживаемого psutil"))
     except AssertionError as e:
         print(fail(f"offline deps: {e}"))
+        failures += 1
+
+    try:
+        await check_telethon_both_direction_subscription()
+        print(ok("Telethon transport: incoming+outgoing разделены на две живые подписки"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"Telethon transport: {type(e).__name__}: {e}"))
         failures += 1
 
     # демонстрация блокировки небезопасного модуля

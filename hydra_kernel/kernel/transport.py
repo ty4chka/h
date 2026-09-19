@@ -452,26 +452,70 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
         outgoing: bool = False,
         chats: Optional[List[int]] = None,
     ) -> Callable[[], None]:
-        kw: Dict[str, Any] = {"incoming": incoming, "outgoing": outgoing}
+        """Подписать L0 handler на одно или оба направления сообщений.
+
+        Telethon считает ``NewMessage(incoming=True, outgoing=True)``
+        взаимоисключающим фильтром: такая подписка не получает *ни одного*
+        события. Hydra использует обе стороны для команд/моста кнопок, поэтому
+        разворачиваем этот случай в две корректные Telethon-подписки.
+        """
+
+        base_kw: Dict[str, Any] = {}
         if pattern:
-            kw["pattern"] = pattern
+            base_kw["pattern"] = pattern
         if chats:
-            kw["chats"] = chats
+            base_kw["chats"] = chats
+
+        directions: List[Dict[str, bool]] = []
+        if incoming:
+            directions.append({"incoming": True})
+        if outgoing:
+            directions.append({"outgoing": True})
+        if not directions:
+            return lambda: None
 
         async def wrapper(event: Any) -> None:
+            raw_message = getattr(event, "message", None)
+            is_outgoing = bool(getattr(event, "out", getattr(raw_message, "out", False)))
+            sender_id = getattr(event, "sender_id", None) or getattr(raw_message, "sender_id", None)
+            # Telegram иногда не заполняет sender_id у собственного outgoing
+            # сообщения. Иначе PermissionManager бесшумно отбросит команду.
+            if not sender_id and is_outgoing:
+                sender_id = self._me_id
+            text = (
+                getattr(event, "raw_text", None)
+                or getattr(event, "text", None)
+                or getattr(raw_message, "message", None)
+                or ""
+            )
             msg = Message(
-                chat_id=event.chat_id,
-                sender_id=event.sender_id or 0,
-                text=event.text or "",
-                outgoing=event.out,
-                message_id=event.message.id,
+                chat_id=getattr(event, "chat_id", 0) or 0,
+                sender_id=sender_id or 0,
+                text=str(text),
+                outgoing=is_outgoing,
+                message_id=getattr(raw_message, "id", getattr(event, "id", 0)) or 0,
                 raw=event,
                 transport=self,
             )
             await handler(msg)
 
-        self._client.on(events.NewMessage(**kw))(wrapper)
-        return lambda: None
+        registrations: List[Any] = []
+        for direction in directions:
+            builder = events.NewMessage(**base_kw, **direction)
+            self._client.add_event_handler(wrapper, builder)
+            registrations.append(builder)
+
+        def unsubscribe() -> None:
+            remove = getattr(self._client, "remove_event_handler", None)
+            if not callable(remove):
+                return
+            for builder in registrations:
+                try:
+                    remove(wrapper, builder)
+                except Exception:  # noqa: BLE001 - cleanup must stay best-effort
+                    pass
+
+        return unsubscribe
 
     def subscribe_inline(self, handler: Callable) -> Callable[[], None]:  # pragma: no cover
         async def wrapper(event: Any) -> None:
