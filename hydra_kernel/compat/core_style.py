@@ -20,6 +20,13 @@ logger = logging.getLogger("hydra_kernel.compat.core")
 
 
 def _import_module(name: str) -> Any:
+    # Родные L4-модули могут импортировать Telethon/aiohttp/psutil только для
+    # аннотаций или редких сетевых команд.  В smoke-режиме эти зависимости
+    # намеренно необязательны, поэтому сначала ставим shims отсутствующих
+    # пакетов (на реальные установленный пакеты это не влияет).
+    from .offline_deps import ensure_offline_dependencies
+
+    ensure_offline_dependencies()
     return importlib.import_module(f"modules.{name}")
 
 

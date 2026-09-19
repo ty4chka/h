@@ -41,6 +41,21 @@ def fail(text: str) -> str:
     return f"{RED}FAIL{RESET} {text}"
 
 
+def source_fixture(reference: Path, fixture: Path) -> tuple[str, Path]:
+    """Прочитать внешний ref, если он есть, иначе versioned fixture из репо.
+
+    Раньше acceptance-run безусловно читал ``../refs/...`` — путь существовал
+    только на машине разработчика и превращал заявленную офлайн-сборку в два
+    FileNotFoundError. Fixtures сохраняют проверку настоящего исходника,
+    но делают её воспроизводимой в clean checkout и Termux.
+    """
+
+    path = reference if reference.is_file() else fixture
+    if not path.is_file():
+        raise FileNotFoundError(f"compat fixture is missing: {fixture}")
+    return path.read_text(encoding="utf-8"), path
+
+
 # ---------------------------------------------------------------- compile
 def compile_trees() -> int:
     total = 0
@@ -268,8 +283,11 @@ async def smoke(framework: str, source: str, expected, inline=None, cb=None, ext
 
 
 async def real_mcub_module() -> None:
-    """Настоящий модуль из hairpin01/MCUB-fork через адаптер."""
-    src = (ROOT.parent / "refs" / "mcub" / "modules" / "translations.py").read_text(encoding="utf-8")
+    """Настоящий MCUB translations через адаптер (ref либо versioned fixture)."""
+    src, _path = source_fixture(
+        ROOT.parent / "refs" / "mcub" / "modules" / "translations.py",
+        ROOT / "extras" / "mcub_pack" / "translations.py",
+    )
     h = Hydra(owner_id=1000)
     await h.start()
     await h.loader.load_source("translations", src, framework="mcub")
@@ -327,6 +345,21 @@ async def mcub_pack_suite() -> None:
         except Exception as e:  # noqa: BLE001
             errors.append((f.stem, f"{type(e).__name__}: {e}"))
     assert not errors, f"не загрузились: {errors}"
+
+    # ``on_load`` у UpdatesMod использует вложенную группу material_emoji.
+    # Lifecycle логирует исключения хуков вместо их проброса, поэтому проверяем
+    # результат и не позволяем скрытому hook failure считаться успешной загрузкой.
+    updates = h.registry.get("updates")
+    assert updates is not None, "updates не зарегистрирован"
+    assert getattr(updates.module, "PREMIUM_EMOJI", {}).get("bar") == "▰▰▰", \
+        "UpdatesMod.on_load не инициализировал material_emoji"
+
+    # LogBot должен пройти lifecycle, но не может создавать Telegram-чат через
+    # NullTransport. Его offline no-op не должен оставлять фиктивный chat id.
+    log_bot = h.registry.get("log_bot")
+    assert log_bot is not None, "log_bot не зарегистрирован"
+    assert not h.config.get("log_chat_id"), "offline LogBot создал log_chat_id"
+
     await h.transport.inject(500, ".info", sender_id=1000, outgoing=True)
     assert h.transport.sent and h.transport.sent[-1].text.strip() != ".info", \
         ".info из пака не ответил"
@@ -497,9 +530,10 @@ async def bridge_suite() -> None:
 
 async def real_heroku_module() -> None:
     """Настоящий модуль coddrago/Heroku (пакетные импорты) через адаптер."""
-    src = (
-        ROOT.parent / "refs" / "heroku" / "heroku" / "modules" / "translations.py"
-    ).read_text(encoding="utf-8")
+    src, _path = source_fixture(
+        ROOT.parent / "refs" / "heroku" / "heroku" / "modules" / "translations.py",
+        ROOT / "extras" / "heroku_pack" / "translations.py",
+    )
     h = Hydra(owner_id=1000)
     await h.start()
     await h.loader.load_source("translations", src, framework="heroku")
@@ -548,7 +582,7 @@ async def main() -> int:
 
     try:
         await real_mcub_module()
-        print(ok("real refs/mcub modules/translations.py: форма языков, кнопка en, .setlang ru"))
+        print(ok("real MCUB translations (vendored fixture/ref): форма языков, кнопка en, .setlang ru"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"real mcub translations: {type(e).__name__}: {e}"))
         failures += 1

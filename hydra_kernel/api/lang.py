@@ -21,11 +21,25 @@ GLOBAL_PACK: Dict[str, Dict[str, Any]] = {
     "ru": {
         "buttons": {"close": "❌ Закрыть", "back": "⬅️ Назад", "refresh": "🔄 Обновить"},
         "error": {"generic": "⚠️ Ошибка: {error}"},
+        # MCUB UpdatesMod обращается к этой вложенной группе напрямую.
+        "material_emoji": {
+            "process_bar_pr_1": "▰",
+            "process_bar_pr_2": "▰",
+            "process_bar_pr_3": "▰",
+            "load_3": "🔭",
+        },
         "ok": "✅ Готово",
     },
     "en": {
         "buttons": {"close": "❌ Close", "back": "⬅️ Back", "refresh": "🔄 Refresh"},
         "error": {"generic": "⚠️ Error: {error}"},
+        # MCUB UpdatesMod addresses this nested group directly.
+        "material_emoji": {
+            "process_bar_pr_1": "▰",
+            "process_bar_pr_2": "▰",
+            "process_bar_pr_3": "▰",
+            "load_3": "🔭",
+        },
         "ok": "✅ Done",
     },
 }

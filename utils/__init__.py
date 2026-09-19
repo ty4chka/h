@@ -1,7 +1,13 @@
 from utils.misc import (
     register_placeholder,
     register_media_placeholder,
+    register_decorated_placeholders,
+    placeholders,
+    unregister_placeholder,
     unregister_scope,
+    list_placeholder_keys,
+    format_placeholders,
+    config_placeholders,
     resolve_placeholders,
     resolve_media_placeholders,
     edit_or_reply,

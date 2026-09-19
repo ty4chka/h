@@ -55,5 +55,6 @@ callable-кнопки, синхронный `self._db`, `internal_init()`, `stri
 | `@event("chataction", ...)` MCUB | сведено к watcher (транспорт L0 — NewMessage-модель) |
 | `ratelimit`, `tag` Heroku | no-op метки |
 | `conversation.get_response` | требует живой транспорт (NullTransport — NotImplementedError) |
+| Telegram-only startup work (например, создание log-чата) | модуль может проверить `kernel.is_offline`; в NullTransport это no-op, в TelethonTransport `ClientProxy` делегирует расширенные RPC-методы нативному клиенту |
 | native inline-ответы | NullTransport записывает в `inline_answers`; TelethonTransport — `event.answer` |
 | модули Heroku с пакетными относительными импортами (`from .. import ...`, `herokutl`) | вне офлайн-прогона: это ядро Heroku, а не модуль; покрытие — API-эквивалентность |

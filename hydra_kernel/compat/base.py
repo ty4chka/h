@@ -6,7 +6,7 @@ import sys
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..kernel.transport import Transport
+from ..kernel.transport import NullTransport, Transport
 from ..kernel.db import MemoryDB
 
 
@@ -17,6 +17,55 @@ class ClientProxy:
         self._t = transport
 
     @property
+    def is_offline(self) -> bool:
+        """True when no Telegram RPC client exists behind this proxy.
+
+        Compatibility modules can use this to avoid provisioning chats, making
+        HTTP calls, or otherwise attempting a Telegram-only side effect during
+        a ``NullTransport`` smoke run.
+        """
+
+        return isinstance(self._t, NullTransport)
+
+    def _native_client(self) -> Any:
+        """Return the underlying Telethon client when the transport has one."""
+
+        if self.is_offline:
+            return None
+        client = getattr(self._t, "client", None)
+        return client if client is not self else None
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose the live client's extended Telethon surface when available.
+
+        ``ClientProxy`` intentionally owns the normalized methods below, while
+        this fallback keeps MCUB modules able to use operations such as
+        ``iter_dialogs`` and ``get_input_entity`` with ``TelethonTransport``.
+        Special methods are not delegated by Python, so ``__call__`` is
+        implemented explicitly below.
+        """
+
+        client = self._native_client()
+        if client is not None:
+            return getattr(client, name)
+        raise AttributeError(f"{type(self).__name__} has no attribute {name!r} in offline mode")
+
+    async def __call__(self, request: Any) -> Any:
+        """Forward raw Telethon requests on a live transport.
+
+        A clear exception is preferable to Python's opaque ``not callable``
+        when a module accidentally tries Telegram RPC during an offline run.
+        """
+
+        client = self._native_client()
+        if callable(client):
+            result = client(request)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        raise RuntimeError("Telegram RPC requests require a live transport")
+
+    @property
     def me_id(self) -> int:
         return self._t.me_id
 
@@ -25,7 +74,24 @@ class ClientProxy:
         return self._t.me_id
 
     async def get_me(self) -> Any:
-        return types.SimpleNamespace(id=self._t.me_id, first_name="Hydra", username="hydra")
+        return types.SimpleNamespace(
+            id=self._t.me_id,
+            first_name="Hydra",
+            username="hydra",
+            premium=False,
+        )
+
+    async def translate(self, *args: Any, **kw: Any) -> str:
+        """Детерминированный офлайн-fallback для Hikka ``client.translate``.
+
+        Реальный перевод — ответственность Telegram/Telethon. Для тестового
+        транспорта сохраняем текст и помечаем запрошенный язык, вместо того
+        чтобы выбрасывать AttributeError и оставлять команду без ответа.
+        """
+
+        text = str(kw.get("raw_text") or "")
+        language = str(args[2]) if len(args) > 2 else str(kw.get("lang") or "")
+        return f"[{language}] {text}".strip()
 
     async def send_message(self, entity: Any, text: str, **kw: Any) -> Any:
         return await self._t.send(int(entity), text, **kw)

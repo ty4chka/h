@@ -54,6 +54,20 @@ class Message:
         return self.text
 
     @property
+    def peer_id(self) -> int:
+        """Telethon-совместимый идентификатор диалога."""
+        return self.chat_id
+
+    @property
+    def entities(self) -> list[Any]:
+        """NullTransport не парсит разметку, но Hikka ждёт iterable."""
+        return []
+
+    async def get_reply_message(self) -> Any:
+        """В офлайн-сообщении нет цепочки reply; API остаётся совместимым."""
+        return None
+
+    @property
     def sender(self) -> Any:
         """telethon-совместимость: event.sender (если raw-событие даёт его)."""
         return getattr(self.raw, "sender", None)
