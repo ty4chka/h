@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Hydra — чат Telegram</title>
+<style>
+  body { background:#0e1621; color:#e9edf0; font:14px/1.45 -apple-system,'Segoe UI',Roboto,sans-serif;
+         margin:0; padding:0 12px 24px; }
+  .chat { max-width:560px; margin:0 auto; }
+  .tg-head { position:sticky; top:0; background:#17212b; border-bottom:1px solid #0e1621;
+              padding:10px 14px; display:flex; align-items:center; gap:10px; margin:0 -12px 14px; }
+  .ava { width:38px; height:38px; border-radius:50%; background:linear-gradient(135deg,#5b9def,#8e6cef);
+          display:flex; align-items:center; justify-content:center; font-size:18px; }
+  .tg-head .name { font-weight:600; }
+  .tg-head .state { font-size:12px; color:#7d8b99; }
+  .row { display:flex; margin:6px 0; }
+  .row.me { justify-content:flex-end; }
+  .bub { max-width:80%; padding:7px 11px; border-radius:12px; white-space:normal;
+          word-break:break-word; position:relative; }
+  .me .bub { background:#2b5278; border-bottom-right-radius:4px; }
+  .bot .bub { background:#182533; border-bottom-left-radius:4px; }
+  .edit .bub { background:#182533; border:1px dashed #39506b; }
+  .edit::before { content:"✏️ сообщение изменено"; display:block; color:#7d8b99;
+                   font-size:11px; margin:0 0 2px; }
+  .del .bub { background:transparent; color:#7d8b99; font-size:12px; }
+  .t { float:right; color:#7d8b99; font-size:11px; margin:8px 0 0 8px; }
+  .me .t::after { content:" ✓✓"; color:#6ab7ff; }
+  .cmd { font-family:ui-monospace,Menlo,Consolas,monospace; background:#0e1621;
+          color:#6ab7ff; padding:1px 5px; border-radius:5px; }
+  .bot .bub b { color:#fff; }
+  .date { text-align:center; color:#7d8b99; font-size:12px; margin:12px 0; }
+</style></head><body>
+<div class="chat">
+  <div class="tg-head">
+    <div class="ava">🧬</div>
+    <div><div class="name">Избранное</div>
+    <div class="state">Hydra userbot · всё ниже — реальный вывод ядра</div></div>
+  </div>
+  <div class="date">Сегодня</div>
+  <div class="row me"><div class="bub">.ping<span class="t">12:00</span></div></div>
+  <div class="row bot"><div class="bub">🏓 Понг!<br>⏱ Аптайм: 0 с<br><br><b>⚙️ Меню #1:</b><br><span class="cmd">.cb 1 1</span> 🔄 Обновить ┃ <span class="cmd">.cb 2 1</span> ❌ Закрыть<br><span class="cmd">.it 1 1</span> ✏️ Подпись<span class="t">12:01</span></div></div>
+  <div class="row me"><div class="bub">.cb 1<span class="t">12:02</span></div></div>
+  <div class="row edit"><div class="bub">🏓 Понг! ♻️<br>⏱ Аптайм: 0 с<br><br><b>⚙️ Меню #1:</b><br><span class="cmd">.cb 1 1</span> 🔄 Обновить ┃ <span class="cmd">.cb 2 1</span> ❌ Закрыть<br><span class="cmd">.it 1 1</span> ✏️ Подпись<span class="t">12:03</span></div></div>
+  <div class="row me"><div class="bub">.it 1 бро<span class="t">12:04</span></div></div>
+  <div class="row edit"><div class="bub">🏓 бро<br><br><b>⚙️ Меню #1:</b><br><span class="cmd">.cb 1 1</span> 🔄 Обновить ┃ <span class="cmd">.cb 2 1</span> ❌ Закрыть<br><span class="cmd">.it 1 1</span> ✏️ Подпись<span class="t">12:05</span></div></div>
+  <div class="row me"><div class="bub">.ping<span class="t">12:06</span></div></div>
+  <div class="row bot"><div class="bub">🏓 Понг!<br>⏱ Аптайм: 0 с<br><br><b>⚙️ Меню #2:</b><br><span class="cmd">.cb 1 2</span> 🔄 Обновить ┃ <span class="cmd">.cb 2 2</span> ❌ Закрыть<br><span class="cmd">.it 1 2</span> ✏️ Подпись<span class="t">12:07</span></div></div>
+  <div class="row me"><div class="bub">.it 1 2 из чата Telegram<span class="t">12:08</span></div></div>
+  <div class="row edit"><div class="bub">🏓 из чата Telegram<br><br><b>⚙️ Меню #2:</b><br><span class="cmd">.cb 1 2</span> 🔄 Обновить ┃ <span class="cmd">.cb 2 2</span> ❌ Закрыть<br><span class="cmd">.it 1 2</span> ✏️ Подпись<span class="t">12:09</span></div></div>
+  <div class="row me"><div class="bub">.cb 2 2<span class="t">12:10</span></div></div>
+  <div class="row del"><div class="bub">🗑 сообщение удалено<span class="t">12:11</span></div></div>
+  <div class="row me"><div class="bub">.echo привет из Go<span class="t">12:12</span></div></div>
+  <div class="row bot"><div class="bub">🔊 Эхо: привет из Go<br><br><b>⚙️ Меню #3:</b><br><span class="cmd">.cb 1 3</span> 🔁 Повторить ┃ <span class="cmd">.cb 2 3</span> ❌ Закрыть<span class="t">12:13</span></div></div>
+  <div class="row me"><div class="bub">.cb 1 3<span class="t">12:14</span></div></div>
+  <div class="row edit"><div class="bub">🔊 Эхо: привет из Go (ещё раз)<br><br><b>⚙️ Меню #3:</b><br><span class="cmd">.cb 1 3</span> 🔁 Повторить ┃ <span class="cmd">.cb 2 3</span> ❌ Закрыть<span class="t">12:15</span></div></div>
+  <div class="row me"><div class="bub">.cb 2 3<span class="t">12:16</span></div></div>
+  <div class="row del"><div class="bub">🗑 сообщение удалено<span class="t">12:17</span></div></div>
+  <div class="row me"><div class="bub">.iqs search мой-api-ключ-123<span class="t">12:18</span></div></div>
+  <div class="row bot"><div class="bub">🔐 сохранённый inline-запрос <span class="cmd">9821759c</span><br>search мой-api-ключ-123<span class="t">12:19</span></div></div>
+  <div class="row bot"><div class="bub">🔐 Запрос сохранён в избранное. Запуск: <span class="cmd">.iq 9821759c</span><span class="t">12:20</span></div></div>
+  <div class="row me"><div class="bub">.iq 9821759c<span class="t">12:21</span></div></div>
+  <div class="row bot"><div class="bub"><b>🔎 search</b> (из избранного 🔐) — результатов: 1<br>1. Результат: мой-api-ключ-123<span class="t">12:22</span></div></div>
+  <div class="row me"><div class="bub">.cbf<span class="t">12:23</span></div></div>
+  <div class="row bot"><div class="bub">🎛 <b>подсказки меню скрыты (кнопки работают вслепую, .iq доступен)</b><span class="t">12:24</span></div></div>
+  <div class="row me"><div class="bub">.ping<span class="t">12:25</span></div></div>
+  <div class="row bot"><div class="bub">🏓 Понг!<br>⏱ Аптайм: 0 с<span class="t">12:26</span></div></div>
+  <div class="row me"><div class="bub">.cbf<span class="t">12:27</span></div></div>
+  <div class="row bot"><div class="bub">🎛 <b>подсказки меню включены</b><span class="t">12:28</span></div></div>
+</div></body></html>

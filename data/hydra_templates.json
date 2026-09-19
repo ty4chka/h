@@ -1,0 +1,30 @@
+{
+  "ping": {
+    "template": "**🏓 {emoji} {title}**\n\n⚡ Сеть: `{ping}ms`\n🛠 Ядро: `{core}ms`\n⏳ Аптайм: `{uptime}`\n\n_{footer}_",
+    "emoji": "🏓",
+    "title": "Результаты",
+    "footer": "Hydra Cython",
+    "image_url": ""
+  },
+  "info": {
+    "template": "**{emoji} {title}**\n\n👤 `{owner}`\n⏰ `{uptime}`\n⚡ `{core}ms`\n📦 `{modules}` модулей\n\n_{footer}_",
+    "emoji": "🔱",
+    "title": "HYDRA",
+    "footer": "⚡ Cython Edition",
+    "image_url": ""
+  },
+  "help": {
+    "template": "**📚 {title}**\n\n📊 Модулей: {modules}\n📝 Команд: {commands}\n🔧 Префикс: `{prefix}`\n\n{modules_list}\n\n_{footer}_",
+    "emoji": "📚",
+    "title": "СПРАВКА",
+    "footer": "Используйте .help <модуль>",
+    "image_url": ""
+  },
+  "start": {
+    "template": "**{emoji} {title}**\n\n👋 Привет, {owner}!\n\n🚀 Hydra запущена\n📦 Модулей: {modules}\n⚡ Ядро: Cython\n\n{footer}",
+    "emoji": "🚀",
+    "title": "HYDRA STARTED",
+    "footer": "Всё работает отлично!",
+    "image_url": ""
+  }
+}

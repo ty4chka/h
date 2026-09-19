@@ -1,0 +1,46 @@
+# Python bytecode & build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.so
+build/
+
+# Sessions (Telegram auth — sensitive)
+*.session
+*.session-journal
+
+# Sensitive/account data
+data/accounts.json
+data/backups/
+data/fheta_token.json
+
+# Test/debug junk
+test.py
+test_mtproto.session
+app-debug.apk
+
+# Editor/tmp junk
+*~
+*.bak
+*.bak.*
+
+# Misc single-letter / scratch files
+d
+d.sh
+m
+p.py
+p.txt
+promt.txt
+t.py
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets & runtime junk (see README security note)
+ai_keys.json
+*.log
+openagent_sessions/
+*.zip
+data/kernel_config.json

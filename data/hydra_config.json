@@ -1,0 +1,17 @@
+{
+  "prefix": ".",
+  "aliases": {},
+  "owner_id": 0,
+  "info_settings": {
+    "show_uptime": true,
+    "show_core_speed": true,
+    "show_modules_count": true,
+    "custom_title": "HYDRA USERBOT",
+    "custom_footer": "Cython Edition"
+  },
+  "appearance": {
+    "use_blocks": true,
+    "use_emojis": true,
+    "theme": "default"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "model": "deepseek-r1-distill-llama-70b",
+  "theme": "cyberpunk",
+  "user_name": "Пользователь",
+  "assistant_name": "MIND SIRI AI",
+  "voice_mode": false,
+  "max_history": 100,
+  "animation": true,
+  "emoji": true,
+  "tts_engine": "termux",
+  "custom_colors": {},
+  "loading_animation": "spiral",
+  "font_style": "standard",
+  "gradient_speed": 1.0
+}

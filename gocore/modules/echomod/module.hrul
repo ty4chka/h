@@ -1,0 +1,7 @@
+# hrul-манифест модуля echomod: два Go-файла -> один бинарник
+name = echomod
+lang = go
+version = 2.0.0
+entry = main.go
+sources = main.go echo.go
+output = ../../bin/echomod

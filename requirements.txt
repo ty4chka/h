@@ -1,0 +1,36 @@
+# === ЯДРО ===
+telethon>=1.35.0
+rich>=13.0.0
+
+# === CYTHON ===
+cython>=3.0.0
+
+# === ВЕБ-ВХОД (Telethon Web) ===
+# Telethon StringSession для QR/web авторизации
+# Уже входит в telethon, но явно:
+telethon-session-sqlite>=0.1.0
+
+# === СЕРВЕР / API ===
+# Для веб-интерфейса входа (опционально, если хочешь полноценный веб-UI)
+fastapi>=0.110.0
+uvicorn>=0.27.0
+aiohttp>=3.9.0
+python-multipart>=0.0.9
+
+# === ТЕРМИНАЛ ===
+# PTY для chroot (уже в stdlib, но для совместимости)
+ptyprocess>=0.7.0
+
+# === СИСТЕМНАЯ ИНФОРМАЦИЯ ===
+psutil>=5.9.0
+
+# === AI КОНВЕРТЕР ===
+aiohttp>=3.9.0  # уже указан выше
+
+# === УТИЛИТЫ ===
+pillow>=10.0.0  # PIL для yamusic и других модулей
+
+# === ДЕВ / СБОРКА ===
+setuptools>=69.0.0
+wheel>=0.42.0
+
