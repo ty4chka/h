@@ -26,23 +26,39 @@ logger = logging.getLogger("hydra_kernel.compat.core")
 _COMMAND_FROM_PATTERN = re.compile(r"\\\.([A-Za-z0-9_]+)")
 
 
-def _command_from_builder(builder: Any) -> str | None:
-    """Extract a simple ``.command`` name from a NewMessage builder.
+def event_builder_pattern(builder: Any) -> str | None:
+    """Return the source regex from offline *or real* Telethon builders.
 
-    Native setup modules in this repository deliberately use exact patterns
-    such as ``(?i)^\\.cfg(?:\\s|$)``.  Do not attempt to interpret arbitrary
-    Telethon regexes: if a handler does not have this unambiguous shape it is
-    simply absent from the presentation catalogue, never from dispatch.
+    The offline shim preserves ``kwargs['pattern']``.  Real Telethon instead
+    turns a string into ``re.Pattern.match`` and stores that bound method in
+    ``builder.pattern``.  Both are valid public runtime shapes, so command
+    discovery must understand both rather than silently dropping setup
+    commands in a real installation.
     """
 
-    pattern = getattr(builder, "pattern", None)
-    if hasattr(pattern, "pattern"):
-        pattern = pattern.pattern
-    if not isinstance(pattern, str):
-        kwargs = getattr(builder, "kwargs", None)
-        if isinstance(kwargs, dict):
-            pattern = kwargs.get("pattern")
-    if not isinstance(pattern, str):
+    candidates = [getattr(builder, "pattern", None)]
+    kwargs = getattr(builder, "kwargs", None)
+    if isinstance(kwargs, dict):
+        candidates.append(kwargs.get("pattern"))
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            return candidate
+        nested = getattr(candidate, "pattern", None)
+        if isinstance(nested, str):
+            return nested
+        # Telethon v1: ``self.pattern = re.compile(pattern).match``.
+        owner = getattr(candidate, "__self__", None)
+        nested = getattr(owner, "pattern", None)
+        if isinstance(nested, str):
+            return nested
+    return None
+
+
+def _command_from_builder(builder: Any) -> str | None:
+    """Extract a simple ``.command`` name from a NewMessage builder."""
+
+    pattern = event_builder_pattern(builder)
+    if pattern is None:
         return None
     match = _COMMAND_FROM_PATTERN.search(pattern)
     return match.group(1).lower() if match else None

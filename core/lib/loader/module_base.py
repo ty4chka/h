@@ -235,6 +235,17 @@ class Strings:
             loc = pack.get(self.locale) or pack.get('ru') or {}
             for k, v in loc.items():
                 merged.setdefault(k, v)
+        # ``tools/build_native.py`` may leave an older compiled api.lang
+        # extension in place until the end of a build.  Real MCUB UpdatesMod
+        # invokes this nested group during startup, so retain the essential
+        # compatibility fallback even if that stale extension predates it.
+        if not isinstance(merged.get("material_emoji"), dict):
+            merged["material_emoji"] = {
+                "process_bar_pr_1": "▰",
+                "process_bar_pr_2": "▰",
+                "process_bar_pr_3": "▰",
+                "load_3": "🔭",
+            }
         return merged
 
     @property

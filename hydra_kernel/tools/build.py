@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from hydra_kernel import Hydra  # noqa: E402
+from hydra_kernel.compat.core_style import event_builder_pattern  # noqa: E402
 from hydra_kernel.pkg.resolver import resolve, CyclicDependency  # noqa: E402
 from hydra_kernel.pkg.manifest import Manifest  # noqa: E402
 from hydra_kernel.pkg.scanner import scan_source, SecurityError  # noqa: E402
@@ -139,6 +140,33 @@ def check_android_optional_dependency_fallback() -> None:
             _sys.modules.pop(probe, None)
 
 
+def check_stale_native_lang_fallback() -> None:
+    """MCUB nested strings survive an older compiled api.lang extension.
+
+    Native extensions take precedence over ``.py`` and may originate from a
+    prior checkout until the build's final native step refreshes them.  The
+    MCUB compatibility layer must therefore retain the startup strings used by
+    UpdatesMod independently of extension freshness.
+    """
+
+    import copy
+    import types
+
+    from core.lib.loader.module_base import Strings
+    from hydra_kernel.api import lang
+
+    original = copy.deepcopy(lang.GLOBAL_PACK)
+    try:
+        for locale in lang.GLOBAL_PACK.values():
+            locale.pop("material_emoji", None)
+        strings = Strings(types.SimpleNamespace(config={"language": "ru"}), {"name": "updates"})
+        group = strings("material_emoji")
+        assert callable(group) and group("load_3") == "🔭"
+    finally:
+        lang.GLOBAL_PACK.clear()
+        lang.GLOBAL_PACK.update(original)
+
+
 async def check_telethon_both_direction_subscription() -> None:
     """Реальный Telethon запрещает incoming=True вместе с outgoing=True.
 
@@ -227,6 +255,13 @@ async def check_telethon_both_direction_subscription() -> None:
 
         unsubscribe()
         assert len(client.removed) == 2, "отписка не сняла обе Telethon-подписки"
+
+        # Real Telethon keeps a bound ``re.Pattern.match`` in ``pattern``;
+        # offline builders instead expose kwargs.  Discovery must support both.
+        class RealTelethonShape:
+            pattern = re.compile(r"(?i)^\.cfg(?:\s|$)").match
+
+        assert event_builder_pattern(RealTelethonShape()) == r"(?i)^\.cfg(?:\s|$)"
     finally:
         transport_module._HAVE_TELETHON = old_have
         transport_module.events = old_events
@@ -348,9 +383,20 @@ async def live_dispatcher_command_suite() -> None:
         async def send_file(self, entity, file, **kw):
             return await self.send_message(entity, kw.get("caption") or str(file), **kw)
 
+    class NewMessage:
+        """Real Telethon stores ``re.Pattern.match``, not raw kwargs."""
+
+        def __init__(self, **kwargs):
+            self.incoming = kwargs.get("incoming")
+            self.outgoing = kwargs.get("outgoing")
+            source = kwargs.get("pattern")
+            self.pattern = re.compile(source).match if isinstance(source, str) else source
+
     old_events, old_have = transport_module.events, transport_module._HAVE_TELETHON
+    old_new_message = events.NewMessage
+    events.NewMessage = NewMessage
     transport_module.events = types.SimpleNamespace(
-        NewMessage=events.NewMessage,
+        NewMessage=NewMessage,
         InlineQuery=type("InlineQuery", (), {}),
         CallbackQuery=type("CallbackQuery", (), {}),
     )
@@ -452,6 +498,7 @@ async def live_dispatcher_command_suite() -> None:
             for name in list(hydra.registry.names()):
                 await hydra.unload_module(name)
             await hydra.stop()
+        events.NewMessage = old_new_message
         transport_module.events = old_events
         transport_module._HAVE_TELETHON = old_have
 
@@ -1056,8 +1103,8 @@ async def owned_mcub_modules_suite() -> None:
                 if name:
                     discovered_commands.add(name)
         for _handler, builder in h.transport.client.handlers:
-            raw_pattern = getattr(builder, "kwargs", {}).get("pattern")
-            if isinstance(raw_pattern, str):
+            raw_pattern = event_builder_pattern(builder)
+            if raw_pattern is not None:
                 name = _command_from_pattern(raw_pattern)
                 if name:
                     discovered_commands.add(name)
@@ -1071,9 +1118,12 @@ async def owned_mcub_modules_suite() -> None:
         def setup_hits(text: str) -> set[str]:
             hits = set()
             for _handler, builder in h.transport.client.handlers:
-                raw_pattern = getattr(builder, "kwargs", {}).get("pattern")
+                raw_pattern = event_builder_pattern(builder)
                 matcher = getattr(builder, "pattern", None)
-                if isinstance(raw_pattern, str) and callable(matcher) and matcher(text):
+                matches = bool(matcher(text)) if callable(matcher) else bool(
+                    raw_pattern and re.search(raw_pattern, text)
+                )
+                if raw_pattern is not None and matches:
                     name = _command_from_pattern(raw_pattern)
                     if name:
                         hits.add(name)
@@ -1404,6 +1454,13 @@ async def main() -> int:
         print(ok("offline deps: Android/Termux fallback для неподдерживаемого psutil"))
     except AssertionError as e:
         print(fail(f"offline deps: {e}"))
+        failures += 1
+
+    try:
+        check_stale_native_lang_fallback()
+        print(ok("MCUB strings: fallback material_emoji переживает устаревший native api.lang"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"MCUB strings: {type(e).__name__}: {e}"))
         failures += 1
 
     try:
