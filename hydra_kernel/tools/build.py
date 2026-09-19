@@ -232,6 +232,230 @@ async def check_telethon_both_direction_subscription() -> None:
         transport_module.events = old_events
 
 
+async def live_dispatcher_command_suite() -> None:
+    """Boot the real ``m.py`` dispatcher shape over a fake Telethon client.
+
+    ``NullTransport`` proves module behavior, but it cannot prove that a
+    Telethon event builder reaches a command after the production dispatcher
+    has loaded it.  This is deliberately a transport-shaped test: handlers are
+    registered through :class:`TelethonTransport`, then raw NewMessage-like
+    events are delivered through the actual registered builders.
+    """
+
+    import importlib.util
+    import itertools
+    import types
+
+    from hydra_kernel.compat.offline_deps import ensure_offline_dependencies
+    from hydra_kernel.kernel import transport as transport_module
+
+    ensure_offline_dependencies()
+    from telethon import events
+
+    class FakeSent:
+        def __init__(self, client, chat_id, message_id, text):
+            self.client = client
+            self.chat_id = int(chat_id)
+            self.id = message_id
+            self.message_id = message_id
+            self.text = text
+            self.message = text
+            self.out = True
+
+        async def edit(self, text, **kw):
+            return await self.client.edit_message(self.chat_id, self.id, text, **kw)
+
+        async def delete(self):
+            return await self.client.delete_messages(self.chat_id, self.id)
+
+    class FakeEvent(FakeSent):
+        def __init__(self, client, chat_id, message_id, text, sender_id=1000, outgoing=True):
+            super().__init__(client, chat_id, message_id, text)
+            self.raw_text = text
+            self.sender_id = sender_id
+            self.out = outgoing
+            self.sender = types.SimpleNamespace(id=sender_id, first_name="Owner", username="owner", bot=False)
+            self.message = self
+            self.reply_to_msg_id = None
+            self.is_private = True
+            self.is_group = False
+            self.is_channel = False
+            self.mentioned = False
+
+        async def get_reply_message(self):
+            return None
+
+        async def get_sender(self):
+            return self.sender
+
+        async def get_chat(self):
+            return types.SimpleNamespace(id=self.chat_id, username="audit")
+
+        async def reply(self, text, **kw):
+            return await self.client.send_message(self.chat_id, text, **kw)
+
+    class FakeClient:
+        def __init__(self):
+            self.handlers = []
+            self.removed = []
+            self.sent = []
+            self.deleted = []
+            self._ids = itertools.count(100)
+
+        async def get_me(self):
+            return types.SimpleNamespace(id=1000, username="owner", first_name="Owner")
+
+        def add_event_handler(self, callback, builder=None):
+            self.handlers.append((callback, builder))
+            return callback
+
+        def remove_event_handler(self, callback, builder=None):
+            self.removed.append((callback, builder))
+            try:
+                self.handlers.remove((callback, builder))
+            except ValueError:
+                pass
+
+        def on(self, builder):
+            def decorator(callback):
+                self.add_event_handler(callback, builder)
+                return callback
+
+            return decorator
+
+        async def send_message(self, entity, text, **kw):
+            message = FakeSent(self, entity, next(self._ids), text)
+            self.sent.append(message)
+            return message
+
+        async def edit_message(self, entity, message, text, **kw):
+            message_id = message if isinstance(message, int) else getattr(message, "id", 0)
+            for item in self.sent:
+                if item.chat_id == int(entity) and item.id == message_id:
+                    item.text = item.message = text
+                    return item
+            item = FakeSent(self, entity, message_id or next(self._ids), text)
+            self.sent.append(item)
+            return item
+
+        async def delete_messages(self, entity, messages, **kw):
+            ids = messages if isinstance(messages, (list, tuple)) else [messages]
+            ids = {item if isinstance(item, int) else getattr(item, "id", 0) for item in ids}
+            self.deleted.extend((int(entity), item) for item in ids)
+            self.sent[:] = [item for item in self.sent if not (item.chat_id == int(entity) and item.id in ids)]
+            return []
+
+        async def send_file(self, entity, file, **kw):
+            return await self.send_message(entity, kw.get("caption") or str(file), **kw)
+
+    old_events, old_have = transport_module.events, transport_module._HAVE_TELETHON
+    transport_module.events = types.SimpleNamespace(
+        NewMessage=events.NewMessage,
+        InlineQuery=type("InlineQuery", (), {}),
+        CallbackQuery=type("CallbackQuery", (), {}),
+    )
+    transport_module._HAVE_TELETHON = True
+    hydra = None
+    vector = None
+    original_vector_net_req = None
+    original_ensure_future = None
+    try:
+        client = FakeClient()
+        transport = transport_module.TelethonTransport(client=client)
+        hydra = Hydra(transport=transport, owner_id=1000, prefix=".")
+        await hydra.start()
+        spec = importlib.util.spec_from_file_location(
+            "live_dispatcher_under_test", ROOT / "modules" / "mcub.py"
+        )
+        assert spec and spec.loader
+        dispatcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dispatcher)
+
+        # Vector schedules a real service-side ban check from ``on_load``.
+        # The suite has no Vector credentials and validates dispatch only, so
+        # suppress exactly that background coroutine before it reaches a URL.
+        original_ensure_future = asyncio.ensure_future
+
+        def safe_ensure_future(awaitable, *args, **kwargs):
+            code = getattr(awaitable, "cr_code", None)
+            qualname = getattr(code, "co_qualname", "")
+            if qualname.endswith("Vector._check_ban"):
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                finished = asyncio.get_running_loop().create_future()
+                finished.set_result(None)
+                return finished
+            return original_ensure_future(awaitable, *args, **kwargs)
+
+        asyncio.ensure_future = safe_ensure_future
+        try:
+            records, errors = await dispatcher._load_owned_modules(hydra)
+        finally:
+            asyncio.ensure_future = original_ensure_future
+            original_ensure_future = None
+        assert not errors, f"production dispatcher loader errors: {errors}"
+        assert client.handlers, "production dispatcher registered no Telethon handlers"
+
+        # Silent Tags can wake Vector's unrelated outgoing watcher.  This suite
+        # checks Telegram routing, not Vector's external bot endpoint.
+        for record in records:
+            candidate = record.module
+            if getattr(candidate, "name", "") == "Vector":
+                vector = candidate
+                original_vector_net_req = candidate._net_req
+
+                async def fake_vector_net(_method, _path, **_kw):
+                    return {"username": "vector_audit_bot"}
+
+                candidate._net_req = fake_vector_net
+                break
+
+        async def emit(text: str) -> list[str]:
+            before = len(client.sent)
+            raw = FakeEvent(client, 500, next(client._ids), text)
+            for callback, builder in list(client.handlers):
+                if type(builder).__name__ != "NewMessage":
+                    continue
+                if getattr(builder, "incoming", None) is True and raw.out:
+                    continue
+                if getattr(builder, "outgoing", None) is True and not raw.out:
+                    continue
+                pattern = getattr(builder, "pattern", None)
+                if callable(pattern) and not pattern(text):
+                    continue
+                await callback(raw)
+            await asyncio.sleep(0)
+            return [item.text for item in client.sent[before:]]
+
+        # These were advertised by Approve but previously had no production
+        # handler.  Exercise their harmless branches through live-shaped
+        # delivery, rather than only calling module methods directly.
+        responses = {}
+        for command in (
+            ".ping", ".info", ".modules", ".find ping", ".popular", ".allcmds",
+            ".mload", ".mun", ".mls", ".mhelp", ".mcfg",
+        ):
+            output = await asyncio.wait_for(emit(command), timeout=5)
+            assert output, f"{command}: no Telethon-shaped output"
+            assert any(item.strip() != command for item in output), f"{command}: unedited echo only"
+            responses[command] = "\n".join(output)
+        assert "Pong" in responses[".ping"], responses[".ping"]
+        assert ".cfg" in responses[".allcmds"], "setup commands missing from allcmds catalogue"
+        assert ".terminal_info" in responses[".allcmds"], "core commands missing from allcmds catalogue"
+    finally:
+        if original_ensure_future is not None:
+            asyncio.ensure_future = original_ensure_future
+        if vector is not None and original_vector_net_req is not None:
+            vector._net_req = original_vector_net_req
+        if hydra is not None:
+            for name in list(hydra.registry.names()):
+                await hydra.unload_module(name)
+            await hydra.stop()
+        transport_module.events = old_events
+        transport_module._HAVE_TELETHON = old_have
+
+
 async def check_live_compatibility_shims() -> None:
     """L2 event/conversation shims keep live MCUB modules on Telethon stable."""
 
@@ -601,7 +825,7 @@ async def modules_suite() -> None:
         exclude=("mcub", "__init__"), allow_unsafe=True,
     )
     assert not errors, f"ошибки загрузки: {errors}"
-    assert len(records) == 11, [r.name for r in records]
+    assert len(records) == 13, [r.name for r in records]
     fws = {r.framework for r in records}
     assert {"core", "setup", "mcub", "noop", "hydra"} <= fws, fws
 
@@ -615,10 +839,123 @@ async def modules_suite() -> None:
     assert any("🌐" in m.text for m in h.transport.sent), "родная .mylang не ответила"
 
 
+async def control_manager_suite() -> None:
+    """Exercise the non-menu paths of restored MCUB management commands."""
+
+    import tempfile
+
+    from hydra_kernel.kernel.transport import Message
+
+    source = '''# meta: name=audit_dynamic version=1.0.0 framework=mcub
+from core.lib.loader.module_base import ModuleBase, command
+from core.lib.loader.module_config import ModuleConfig, ConfigValue
+
+class AuditDynamic(ModuleBase):
+    name = "audit_dynamic"
+    config = ModuleConfig(ConfigValue("enabled", True, "audit setting"))
+
+    @command("auditdyn", doc="audit command")
+    async def auditdyn(self, event):
+        await event.edit("audit dynamic works")
+'''
+
+    class Reply:
+        raw_text = source
+        text = source
+        id = 901
+
+    class Raw:
+        async def get_reply_message(self):
+            return Reply()
+
+    h = Hydra(owner_id=1000)
+    await h.start()
+    try:
+        records, errors = await h.loader.load_dir(
+            ROOT / "modules", framework="auto", exclude=("mcub", "__init__"), allow_unsafe=True
+        )
+        assert not errors, errors
+        control = h.registry.get("control").module
+
+        # The actual command's no-reply branch is routed by Hydra; the reply
+        # shape below then exercises its safe install branch without Telegram I/O.
+        before = len(h.transport.sent)
+        await h.transport.inject(500, ".mload", sender_id=1000, outgoing=True)
+        assert len(h.transport.sent) > before and ".mload" in h.transport.sent[-1].text
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            control.modules_dir = Path(temp_dir)
+            event = Message(
+                chat_id=500,
+                sender_id=1000,
+                text=".mload",
+                outgoing=True,
+                message_id=900,
+                raw=Raw(),
+                transport=h.transport,
+            )
+            await control.cmd_mload(event)
+            record = h.registry.get("audit_dynamic")
+            assert record is not None and record.framework == "mcub", "mload did not join unified registry"
+            assert any(Path(temp_dir).glob("*.py")), "mload did not persist source for next boot"
+
+            await h.transport.inject(500, ".mhelp audit_dynamic", sender_id=1000, outgoing=True)
+            assert ".auditdyn" in h.transport.sent[-1].text, "mhelp missed installed MCUB command"
+            await h.transport.inject(500, ".mcfg audit_dynamic", sender_id=1000, outgoing=True)
+            assert "enabled" in h.transport.sent[-1].text and "True" in h.transport.sent[-1].text
+            await h.transport.inject(500, ".mcfg audit_dynamic enabled false", sender_id=1000, outgoing=True)
+            assert "False" in h.transport.sent[-1].text, "mcfg did not update config"
+            await h.transport.inject(500, ".auditdyn", sender_id=1000, outgoing=True)
+            assert h.transport.sent[-1].text == "audit dynamic works", "installed command is not dispatched"
+            await h.transport.inject(500, ".mls", sender_id=1000, outgoing=True)
+            assert "audit_dynamic" in h.transport.sent[-1].text, "mls missed installed module"
+            await h.transport.inject(500, ".mun audit_dynamic --del", sender_id=1000, outgoing=True)
+            assert h.registry.get("audit_dynamic") is None, "mun did not unload module"
+            assert not list(Path(temp_dir).glob("*.py")), "mun --del did not remove saved source"
+            before = len(h.transport.sent)
+            await h.transport.inject(500, ".auditdyn", sender_id=1000, outgoing=True)
+            assert len(h.transport.sent) == before, "mun left the unloaded command subscribed"
+
+            functional_source = '''# meta: name=audit_function version=1.0.0 framework=mcub
+def register(kernel):
+    @kernel.register.command("auditfunc")
+    async def auditfunc(event):
+        await event.edit("audit functional works")
+'''
+            await control._install_mcub_source("audit_function", functional_source)
+            await h.transport.inject(500, ".auditfunc", sender_id=1000, outgoing=True)
+            assert h.transport.sent[-1].text == "audit functional works"
+            await h.transport.inject(500, ".mun audit_function --del", sender_id=1000, outgoing=True)
+            before = len(h.transport.sent)
+            await h.transport.inject(500, ".auditfunc", sender_id=1000, outgoing=True)
+            assert len(h.transport.sent) == before, "mun left functional MCUB command subscribed"
+
+        # The command catalogue comes from all adapters, not only lifecycle
+        # modules, so discovery reflects what production can actually route.
+        await h.transport.inject(500, ".allcmds", sender_id=1000, outgoing=True)
+        catalogue = h.transport.sent[-1].text
+        assert ".cfg" in catalogue and ".terminal_info" in catalogue and ".mload" in catalogue
+
+        # Core/setup adapters now own their subscriptions per registry record,
+        # so a hot reload cannot leave old raw Telethon handlers behind.
+        assert await h.loader.unload("cfg")
+        assert await h.loader.unload("terminal")
+        before = len(h.transport.sent)
+        await h.transport.inject(500, ".cfg", sender_id=1000, outgoing=True)
+        await h.transport.inject(500, ".terminal_info", sender_id=1000, outgoing=True)
+        assert len(h.transport.sent) == before, "native handlers survived unload"
+    finally:
+        for name in list(h.registry.names()):
+            await h.unload_module(name)
+        await h.stop()
+
+
 # Full production inventory.  Entries use harmless usage/menu branches; the
 # two omitted actions are registered below but deliberately not executed by an
 # automated smoke run because they replace the process or compile files.
 OWNED_COMMAND_PROBES = (
+    "ping", "info", "modules", "find", "popular", "allcmds",
+    "mload", "mun", "mls", "mhelp", "mcfg",
     "cfg", "lm", "unlm", "hmods", "compile", "modinfo", "deps", "mcubmods",
     "mylang", "languages", "lang",
     "convert", "fix", "services", "set_key", "show_keys", "stats",
@@ -1077,6 +1414,13 @@ async def main() -> int:
         failures += 1
 
     try:
+        await live_dispatcher_command_suite()
+        print(ok("live dispatcher: Telethon-shaped boot доставляет .ping, info и MCUB-management команды"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"live dispatcher: {type(e).__name__}: {e}"))
+        failures += 1
+
+    try:
         await check_live_compatibility_shims()
         print(ok("live compat: reply_to/id и cleanup отменённого Telethon conversation"))
     except Exception as e:  # noqa: BLE001
@@ -1108,16 +1452,23 @@ async def main() -> int:
 
     try:
         await modules_suite()
-        print(ok("родные modules/ под единым движком: 11 модулей, 0 ошибок, .mylang отвечает"))
+        print(ok("родные modules/ под единым движком: 13 модулей, 0 ошибок, .mylang и .ping отвечают"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"modules suite: {type(e).__name__}: {e}"))
         failures += 1
 
     try:
         await owned_mcub_modules_suite()
-        print(ok("собственные modules/mcub_mods/: все 88 команды инвентаризированы; 86 safe-веток, OpenAgent input и silent-tags проверены"))
+        print(ok("собственные modules/mcub_mods/: все 99 команд инвентаризированы; 97 safe-веток, OpenAgent input и silent-tags проверены"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"owned MCUB modules: {type(e).__name__}: {e}"))
+        failures += 1
+
+    try:
+        await control_manager_suite()
+        print(ok("control: .mload/.mls/.mhelp/.mcfg/.mun работают через единый реестр"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"control manager: {type(e).__name__}: {e}"))
         failures += 1
 
     try:

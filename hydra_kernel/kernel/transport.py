@@ -311,6 +311,14 @@ class _StubClient:
         self.handlers.append((fn, event))
         return fn
 
+    def remove_event_handler(self, fn: Any, event: Any = None) -> None:
+        """Mirror Telethon cleanup so setup modules can be hot-unloaded offline."""
+
+        try:
+            self.handlers.remove((fn, event))
+        except ValueError:
+            pass
+
     def on(self, event: Any) -> Callable:
         def reg(fn: Any) -> Any:
             self.handlers.append((fn, event))

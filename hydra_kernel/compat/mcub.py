@@ -231,6 +231,55 @@ class LoopHandle:
         return self.start()
 
 
+class _RegistrationScope:
+    """Cleanup owned by one loaded MCUB source file.
+
+    MCUB's historic kernel kept a single global list of subscriptions.  That
+    made ``.mun`` unregister a record while its commands still answered.  A
+    source-local scope lets the unified registry unload class-style and
+    ``register(kernel)`` modules symmetrically.
+    """
+
+    def __init__(self, source_name: str) -> None:
+        self.source_name = source_name
+        self._cleanups: list[Callable[[], Any]] = []
+        self._closed = False
+
+    def add(self, cleanup: Callable[[], Any]) -> None:
+        if self._closed:
+            result = cleanup()
+            if inspect.isawaitable(result):
+                result.close() if hasattr(result, "close") else None
+            return
+        self._cleanups.append(cleanup)
+
+    async def unload(self, _module: Any = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for cleanup in reversed(self._cleanups):
+            try:
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - one cleanup must not block the rest
+                logger.debug("MCUB cleanup %s failed: %s", self.source_name, exc)
+        self._cleanups.clear()
+
+
+class _CompositeLifecycle:
+    """Run normal ModuleBase hooks and adapter registrations on unload."""
+
+    def __init__(self, primary: Any, scope: _RegistrationScope) -> None:
+        self.primary = primary
+        self.scope = scope
+
+    async def unload(self, module: Any) -> None:
+        if self.primary is not None:
+            await self.primary.unload(module)
+        await self.scope.unload(module)
+
+
 class ConversationShim:
     """conversation() как в MCUB: context manager + send_message/get_response."""
 
@@ -352,7 +401,7 @@ class KernelRegister:
 
     def bot_command(self, name: str, *args: Any, **kw: Any) -> Callable:
         def deco(fn: Callable) -> Callable:
-            self._iface.h.bot_commands[name] = fn
+            self._iface.register_bot_command(name, fn)
             return fn
 
         return deco
@@ -436,7 +485,7 @@ class KernelRegister:
                             logger.error("loop %s failed: %s", getattr(fn, "__name__", "?"), exc)
 
             handle = LoopHandle(runner, autostart)
-            self._iface._unsubs.append(handle.stop)
+            self._iface._track_cleanup(handle.stop)
             return handle
 
         return deco
@@ -462,6 +511,11 @@ class KernelRegister:
             "expires_at": time.monotonic() + ttl if ttl else None,
             "allow_ttl": allow_ttl,
         }
+
+        def cleanup() -> None:
+            self._iface.inline_callback_map.pop(token, None)
+
+        self._iface._track_cleanup(cleanup)
         return token
 
     async def invoke(self, command: str, args: Any = None, chat_id: Any = None, **_kw: Any) -> Any:
@@ -515,12 +569,51 @@ class McubKernelInterface:
         self._user_emoji: dict[Any, Any] = {}
         self.command_owners: dict[str, str] = {}
         self._inline_owners: dict[str, str] = {}
+        self._scope_stack: list[_RegistrationScope] = []
         self._loader = _McubLoaderView(self)
         self.log_chat_id = self.config.get("log_chat_id")
         self.register = KernelRegister(self)
         # kernel-уровневая фабрика кнопок (без привязки к модулю)
         self.Button = ButtonFactory(types.SimpleNamespace(name="kernel", ctx=None))
+        # Backward-compatible fallback for registrations made outside a loader
+        # call.  All normal sources use a per-module scope below.
         self._unsubs: List[Callable[[], None]] = []
+
+    def begin_registration_scope(self, source_name: str) -> _RegistrationScope:
+        scope = _RegistrationScope(source_name)
+        self._scope_stack.append(scope)
+        return scope
+
+    def end_registration_scope(self, scope: _RegistrationScope) -> None:
+        if self._scope_stack and self._scope_stack[-1] is scope:
+            self._scope_stack.pop()
+            return
+        try:
+            self._scope_stack.remove(scope)
+        except ValueError:
+            pass
+
+    def _track_cleanup(self, cleanup: Callable[[], Any]) -> None:
+        if self._scope_stack:
+            self._scope_stack[-1].add(cleanup)
+        else:
+            self._unsubs.append(cleanup)
+
+    def register_class_instance(self, key: str, module: Any) -> None:
+        """Expose a class during its load and remove that temporary lookup on unload."""
+
+        missing = object()
+        previous = self._class_module_instances.get(key, missing)
+        self._class_module_instances[key] = module
+
+        def cleanup() -> None:
+            if self._class_module_instances.get(key) is module:
+                if previous is missing:
+                    self._class_module_instances.pop(key, None)
+                else:
+                    self._class_module_instances[key] = previous
+
+        self._track_cleanup(cleanup)
 
     @property
     def USER_EMOJI(self) -> dict[Any, Any]:
@@ -598,6 +691,9 @@ class McubKernelInterface:
         owner = owner or getattr(getattr(handler, "__self__", None), "name", None)
         original = getattr(handler, "__original__", handler)
         owner = owner or getattr(original, "__module__", None) or "mcub"
+        missing = object()
+        primary_previous = self.h.command_handlers.get(name, missing)
+        primary_registered = False
         for cmd in [name, *(aliases or [])]:
             command_name = str(cmd)
             pattern = rf"(?i)^{re.escape(prefix)}{re.escape(command_name)}(?:\s|$)"
@@ -611,13 +707,46 @@ class McubKernelInterface:
                     logger.error("mcub command %s failed: %s", _cmd, exc)
                     await self.handle_error(exc, event=event)
 
-            self._unsubs.append(
-                self.h.transport.subscribe(wrapper, pattern=pattern, incoming=True, outgoing=True)
+            unsubscribe = self.h.transport.subscribe(
+                wrapper, pattern=pattern, incoming=True, outgoing=True
             )
+            previous_owner = self.command_owners.get(command_name, missing)
+            previous_alias = self.h.aliases.get(command_name, missing)
             self.command_owners[command_name] = str(owner)
             if command_name != name:
                 self.h.aliases[command_name] = name
-        self.h.command_handlers.setdefault(name, handler)
+
+            def cleanup(
+                _name=command_name,
+                _unsubscribe=unsubscribe,
+                _owner=owner,
+                _previous_owner=previous_owner,
+                _previous_alias=previous_alias,
+                _is_alias=command_name != name,
+            ) -> None:
+                _unsubscribe()
+                if self.command_owners.get(_name) == str(_owner):
+                    if _previous_owner is missing:
+                        self.command_owners.pop(_name, None)
+                    else:
+                        self.command_owners[_name] = _previous_owner
+                if _is_alias and self.h.aliases.get(_name) == name:
+                    if _previous_alias is missing:
+                        self.h.aliases.pop(_name, None)
+                    else:
+                        self.h.aliases[_name] = _previous_alias
+
+            self._track_cleanup(cleanup)
+            primary_registered = primary_registered or command_name == name
+        if primary_previous is missing:
+            self.h.command_handlers[name] = handler
+
+            def cleanup_primary() -> None:
+                if self.h.command_handlers.get(name) is handler:
+                    self.h.command_handlers.pop(name, None)
+
+            if primary_registered:
+                self._track_cleanup(cleanup_primary)
 
     def register_watcher(self, handler: Callable, **kw: Any) -> None:
         async def wrapper(event: Any) -> None:
@@ -629,12 +758,30 @@ class McubKernelInterface:
                 logger.error("mcub watcher failed: %s", exc)
 
         options = {k: v for k, v in kw.items() if k in {"pattern", "incoming", "outgoing", "chats"}}
-        self._unsubs.append(self.h.transport.subscribe(wrapper, **options))
+        self._track_cleanup(self.h.transport.subscribe(wrapper, **options))
 
     def register_inline_handler(self, name: str, handler: Callable) -> None:
+        missing = object()
         original = getattr(handler, "__original__", handler)
-        self._inline_owners[name] = str(getattr(original, "__module__", "mcub"))
+        previous_owner = self._inline_owners.get(name, missing)
+        previous_handler = self.h.inline_handlers.get(name, missing)
+        owner = str(getattr(original, "__module__", "mcub"))
+        self._inline_owners[name] = owner
         self.h.register_inline(name, handler)
+
+        def cleanup() -> None:
+            if self._inline_owners.get(name) == owner:
+                if previous_owner is missing:
+                    self._inline_owners.pop(name, None)
+                else:
+                    self._inline_owners[name] = previous_owner
+            if self.h.inline_handlers.get(name) is handler:
+                if previous_handler is missing:
+                    self.h.inline_handlers.pop(name, None)
+                else:
+                    self.h.inline_handlers[name] = previous_handler
+
+        self._track_cleanup(cleanup)
 
     def register_callback_handler(self, prefix: str | bytes, handler: Callable) -> None:
         normalized = prefix.decode(errors="replace") if isinstance(prefix, bytes) else str(prefix)
@@ -646,7 +793,32 @@ class McubKernelInterface:
                 return await result
             return result
 
+        missing = object()
+        previous = self.h.callback_handlers.get(normalized, missing)
         self.h.register_callback(normalized, wrapper)
+
+        def cleanup() -> None:
+            if self.h.callback_handlers.get(normalized) is wrapper:
+                if previous is missing:
+                    self.h.callback_handlers.pop(normalized, None)
+                else:
+                    self.h.callback_handlers[normalized] = previous
+
+        self._track_cleanup(cleanup)
+
+    def register_bot_command(self, name: str, handler: Callable) -> None:
+        missing = object()
+        previous = self.h.bot_commands.get(name, missing)
+        self.h.bot_commands[name] = handler
+
+        def cleanup() -> None:
+            if self.h.bot_commands.get(name) is handler:
+                if previous is missing:
+                    self.h.bot_commands.pop(name, None)
+                else:
+                    self.h.bot_commands[name] = previous
+
+        self._track_cleanup(cleanup)
 
     # -- inline инструменты (как в MCUB-fork) --
     async def inline_query_and_click(self, chat_id: int, query: str, *args: Any, **kw: Any) -> Tuple[bool, Any]:
@@ -842,8 +1014,25 @@ class McubKernelInterface:
             self._live_module_configs[module] = cfg
 
     def store_module_config_schema(self, name: str, config: Any) -> None:
+        missing = object()
+        old_schema = self._module_config_schemas.get(name, missing)
+        old_live = self._live_module_configs.get(name, missing)
         self._module_config_schemas[name] = config
         self._live_module_configs[name] = config
+
+        def cleanup() -> None:
+            if self._module_config_schemas.get(name) is config:
+                if old_schema is missing:
+                    self._module_config_schemas.pop(name, None)
+                else:
+                    self._module_config_schemas[name] = old_schema
+            if self._live_module_configs.get(name) is config:
+                if old_live is missing:
+                    self._live_module_configs.pop(name, None)
+                else:
+                    self._live_module_configs[name] = old_live
+
+        self._track_cleanup(cleanup)
 
     def lookup_module(self, module_name: str) -> Any:
         needle = str(module_name).lower()
@@ -985,47 +1174,56 @@ class McubAdapter(CompatAdapter):
 
     async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
         iface = self.iface
-        ns = self.exec_source(name, source)
-        iface.set_module_exports(name, ns)
+        scope = iface.begin_registration_scope(name)
+        try:
+            ns = self.exec_source(name, source)
+            iface.set_module_exports(name, ns)
 
-        if callable(ns.get("register")):
-            res = ns["register"](iface)
-            if inspect.isawaitable(res):
-                await res
-            return iface, None
+            if callable(ns.get("register")):
+                res = ns["register"](iface)
+                if inspect.isawaitable(res):
+                    await res
+                return iface, scope
 
-        # class-style: shim-ModuleBase ИЛИ подкласс настоящего core ModuleBase
-        cls = None
-        for value in ns.values():
-            if (
-                isinstance(value, type)
-                and value is not ModuleBase
-                and value is not McubModuleBase
-                and getattr(value, "__module__", "") == name
-                and (
-                    issubclass(value, ModuleBase)
-                    or hasattr(value, "_cmd_registry")  # настоящий core-style
-                )
-            ):
-                cls = value
-                break
-        if cls is not None:
-            if hasattr(cls, "_cmd_registry") and not issubclass(cls, ModuleBase):
-                # Настоящий core ModuleBase сам регистрирует декораторы через
-                # iface.register. Сохраняем объект *до* on_load, чтобы другой
-                # модуль той же загрузочной волны мог его require_module().
-                module = cls(kernel=iface)
-                iface._class_module_instances[name] = module
-                iface._class_module_instances.setdefault(getattr(module, "name", name), module)
-                for method in getattr(module, "_method_funcs", ()):
-                    result = method(module)
-                    if inspect.isawaitable(result):
-                        await result
+            # class-style: shim-ModuleBase ИЛИ подкласс настоящего core ModuleBase
+            cls = None
+            for value in ns.values():
+                if (
+                    isinstance(value, type)
+                    and value is not ModuleBase
+                    and value is not McubModuleBase
+                    and getattr(value, "__module__", "") == name
+                    and (
+                        issubclass(value, ModuleBase)
+                        or hasattr(value, "_cmd_registry")  # настоящий core-style
+                    )
+                ):
+                    cls = value
+                    break
+            if cls is not None:
+                if hasattr(cls, "_cmd_registry") and not issubclass(cls, ModuleBase):
+                    # Настоящий core ModuleBase сам регистрирует декораторы через
+                    # iface.register. Сохраняем объект *до* on_load, чтобы другой
+                    # модуль той же волны мог его require_module().
+                    module = cls(kernel=iface)
+                    iface.register_class_instance(name, module)
+                    module_name = str(getattr(module, "name", name))
+                    if module_name != name and module_name not in iface._class_module_instances:
+                        iface.register_class_instance(module_name, module)
+                    for method in getattr(module, "_method_funcs", ()):
+                        result = method(module)
+                        if inspect.isawaitable(result):
+                            await result
+                    lifecycle = await self.h.load_module(module)
+                    return module, _CompositeLifecycle(lifecycle, scope)
+                module = cls(self.h.make_context(name))
+                iface.register_class_instance(name, module)
                 lifecycle = await self.h.load_module(module)
-                return module, lifecycle
-            module = cls(self.h.make_context(name))
-            iface._class_module_instances[name] = module
-            lifecycle = await self.h.load_module(module)
-            return module, lifecycle
+                return module, _CompositeLifecycle(lifecycle, scope)
 
-        raise ValueError(f"mcub:{name}: нет ни register(), ни класса ModuleBase")
+            raise ValueError(f"mcub:{name}: нет ни register(), ни класса ModuleBase")
+        except Exception:
+            await scope.unload()
+            raise
+        finally:
+            iface.end_registration_scope(scope)
