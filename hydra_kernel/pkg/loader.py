@@ -139,7 +139,12 @@ class Loader:
             )
             for stem, res in zip(wave, results):
                 if isinstance(res, Exception):
-                    logger.error("failed to load %s: %s", stem, res)
+                    logger.error(
+                        "failed to load %s: %s",
+                        stem,
+                        res,
+                        exc_info=(type(res), res, res.__traceback__),
+                    )
                     errors.append((stem, res))
                 else:
                     records.append(res)

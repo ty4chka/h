@@ -7,7 +7,7 @@ and runs modules from **five ecosystems at once: Hydra, MCUB, Hikka, Heroku and
 Dragon**. One process — five module families.
 
 ```
-L4  modules/             your modules (ping, terminal, translations, …)
+L4  modules/ + mcub_mods/ your modules (Hydra and saved MCUB modules)
 L3  pkg/                 loader · registry · resolver · manifest · scanner
 L2  compat/              MCUB · Hikka · Heroku · Dragon · legacy Hydra
 L1  api/                 ModuleBase · decorators · permissions · inline · lang
@@ -43,8 +43,12 @@ frameworks — the frameworks know the kernel.
   (`tools/build_native.py`) and picked up by the importer automatically
 - **Security**: AST scanner blocks `exec/eval/os.system/subprocess` before
   execution; `owner_only` permission level
+- **Automatic personal MCUB module loading**: `modules/mcub_mods/*.py`,
+  including OpenAgent, starts alongside normal modules; identical copies are
+  not started twice
 - **Offline builds**: the kernel compiles and passes smoke tests without
-  telethon and without network
+  telethon and without network; unsupported `psutil` on Termux/Android uses a
+  safe fallback
 - **Package system**: manifests, dependency topological sort, registry,
   lifecycle hooks
 

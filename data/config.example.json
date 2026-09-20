@@ -1,0 +1,11 @@
+{
+  "api_id": 123456,
+  "api_hash": "put-your-api-hash-here",
+  "owner_id": 123456789,
+  "prefix": ".",
+  "language": "ru",
+  "proxy_enabled": false,
+  "proxy_addr": "",
+  "proxy_port": 0,
+  "proxy_secret": ""
+}

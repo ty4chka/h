@@ -35,6 +35,6 @@ class EventBus:
                     if asyncio.iscoroutine(res):
                         res = await res
                     results.append(res)
-                except Exception as e:  # noqa: BLE001 — шина не должна падать
-                    logger.error("listener %r for %r failed: %s", listener, event, e)
+                except Exception:  # noqa: BLE001 — шина не должна падать
+                    logger.exception("listener %r for %r failed", listener, event)
         return results

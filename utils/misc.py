@@ -69,6 +69,27 @@ async def edit_or_reply(event, text: str, **kwargs):
     except Exception:
         return await event.reply(text, **kwargs)
 
+
+async def answer(event, text: str, **kwargs):
+    """MCUB-совместимый alias ``utils.answer``."""
+
+    kwargs.pop("as_html", None)
+    return await edit_or_reply(event, text, **kwargs)
+
+
+def get_args_raw(event) -> str:
+    """Вернуть текст после команды в стиле MCUB/Hikka ``utils.get_args_raw``."""
+
+    text = (
+        getattr(event, "raw_text", None)
+        or getattr(event, "text", None)
+        or getattr(event, "message", None)
+        or ""
+    )
+    parts = str(text).split(maxsplit=1)
+    return parts[1] if len(parts) > 1 else ""
+
+
 def rate_limit(limit: int = 20, period: int = 120):
     """Декоратор для ограничения использования команд"""
     def decorator(func):
@@ -217,6 +238,118 @@ async def resolve_media_placeholders(scope, data=None):
         return await _resolve(scope, data or {})
     except ImportError:
         return {}
+
+
+# API custom_placeholders из MCUB-fork.  Настоящие модули импортируют эти
+# функции прямо из ``utils``, поэтому они живут здесь вместе с прокси к
+# core.lib.loader.placeholders.
+def placeholders(
+    key: str,
+    *,
+    timeout=None,
+    description=None,
+    cache_ttl=None,
+    required: bool = False,
+    on_error: str = "keep",
+):
+    if not isinstance(key, str) or not key.replace("_", "a").isalnum():
+        raise ValueError("Invalid placeholder key. Use: letters, digits, underscore")
+    if on_error not in {"keep", "empty", "raise"}:
+        raise ValueError("on_error must be one of: keep, empty, raise")
+
+    def decorator(func):
+        meta = list(getattr(func, "__custom_placeholders__", []))
+        meta.append(
+            {
+                "key": key,
+                "timeout": timeout,
+                "description": description,
+                "cache_ttl": cache_ttl,
+                "required": required,
+                "on_error": on_error,
+            }
+        )
+        func.__custom_placeholders__ = meta
+        return func
+
+    return decorator
+
+
+def register_decorated_placeholders(scope, owner) -> int:
+    """Зарегистрировать все методы ``@utils.placeholders`` объекта."""
+    count = 0
+    for attr_name in dir(owner):
+        try:
+            bound = getattr(owner, attr_name)
+        except Exception:
+            continue
+        if not callable(bound):
+            continue
+        metas = getattr(getattr(bound, "__func__", bound), "__custom_placeholders__", None)
+        if not metas:
+            continue
+        for meta in metas:
+            register_placeholder(
+                scope,
+                meta["key"],
+                bound,
+                timeout=meta.get("timeout"),
+                description=meta.get("description"),
+                cache_ttl=meta.get("cache_ttl"),
+                required=bool(meta.get("required", False)),
+                on_error=meta.get("on_error", "keep"),
+            )
+            count += 1
+    return count
+
+
+def unregister_placeholder(scope, key=None):
+    try:
+        from core.lib.loader.placeholders import _REGISTRY
+
+        items = _REGISTRY.get(scope, {})
+        if key is None:
+            return unregister_scope(scope)
+        if key not in items:
+            return False
+        del items[key]
+        if not items:
+            _REGISTRY.pop(scope, None)
+        return True
+    except ImportError:
+        return False
+
+
+def list_placeholder_keys(scope):
+    try:
+        from core.lib.loader.placeholders import list_placeholder_keys as _list
+
+        return _list(scope)
+    except ImportError:
+        return []
+
+
+def format_placeholders(scope) -> str:
+    """Компактный список ``{token}`` для поля конфигурации MCUB."""
+    return ", ".join(f"{{{key}}}" for key in list_placeholder_keys(scope))
+
+
+def config_placeholders(scope="any"):
+    if scope == "any":
+        try:
+            from core.lib.loader.placeholders import _REGISTRY
+
+            rows = []
+            for scope_name, items in sorted(_REGISTRY.items()):
+                rows.extend(
+                    f"{{{key}}} - {meta.get('description') or 'No docs'} ({scope_name})"
+                    for key, meta in sorted(items.items())
+                )
+            return "\n".join(rows) or None
+        except ImportError:
+            return None
+    keys = list_placeholder_keys(scope)
+    return "\n".join(f"{{{key}}}" for key in keys) or None
 
 
 # Дополнительные утилиты

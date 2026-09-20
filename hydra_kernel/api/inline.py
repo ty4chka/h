@@ -50,6 +50,9 @@ class InlineArticleResult:
     description: str = ""
     text: str = ""
     parse_mode: str = "html"
+    # MCUB inline handlers may provide Telethon/compat buttons. They are kept
+    # here so programmatic ``inline_query_and_click`` can render a text form.
+    buttons: Any = None
 
     @property
     def id(self) -> str:
@@ -73,7 +76,13 @@ class InlineResultBuilder:
     def article(
         self, title: str, description: str = "", text: str = "", parse_mode: str = "html", **kw: Any
     ) -> InlineArticleResult:
-        return InlineArticleResult(title, description, text, parse_mode)
+        return InlineArticleResult(
+            title,
+            description,
+            text,
+            parse_mode,
+            buttons=kw.get("buttons", kw.get("reply_markup")),
+        )
 
     def photo(self, url: str, title: str = "", description: str = "", **kw: Any) -> InlinePhotoResult:
         return InlinePhotoResult(url, title, description)
@@ -100,6 +109,8 @@ class InlineQueryEvent:
         self.raw = raw
         self._t = transport
         self.builder = InlineResultBuilder()
+        # Results are also retained for local MCUB ``inline_query_and_click``.
+        self.results: List[Any] = []
 
     @property
     def args(self) -> str:
@@ -108,13 +119,14 @@ class InlineQueryEvent:
         return parts[1] if len(parts) > 1 else ""
 
     async def answer(self, results: List[Any], **kw: Any) -> Any:
-        if not results:
+        self.results = list(results or [])
+        if not self.results:
             return None
         if self._t is not None and hasattr(self._t, "answer_inline"):
-            return await self._t.answer_inline(self, results, **kw)
+            return await self._t.answer_inline(self, self.results, **kw)
         # фолбэк в стиле MCUB: результаты сообщением
         out = "<b>Results (inline):</b>\n\n"
-        for art in results[:5]:
+        for art in self.results[:5]:
             out += f"<b>{getattr(art, 'title', '')}</b>\n"
             desc = getattr(art, "description", "")
             if desc:
@@ -144,6 +156,12 @@ class CallbackQueryEvent:
         self.message_id = message_id
         self.raw = raw
         self._t = transport
+
+    @property
+    def input_chat(self) -> Any:
+        """Telethon-compatible peer for MCUB callbacks (falls back to chat ID)."""
+
+        return getattr(self.raw, "input_chat", None) or self.chat_id
 
     async def answer(self, text: Optional[str] = None, alert: bool = False, **kw: Any) -> Any:
         if self._t is not None and hasattr(self._t, "answer_callback"):

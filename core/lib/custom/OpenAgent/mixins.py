@@ -200,6 +200,7 @@ class SessionManager:
         self._save_generation = 0
         self._saved_generation = 0
         self._save_debounce_seconds = 0.4
+        self._closed = False
 
     @property
     def _backup_file(self) -> Path:
@@ -342,19 +343,32 @@ class SessionManager:
         except Exception as exc:
             self.log.warning(f"OpenAgent: failed to save sessions: {exc}")
 
+    async def close(self) -> None:
+        """Stop a pending debounce task when the owning module unloads."""
+
+        self._closed = True
+        task = self._save_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._save_task = None
+
     async def _scheduled_save(self) -> None:
         try:
             await asyncio.sleep(self._save_debounce_seconds)
-            while self._saved_generation < self._save_generation:
+            while not self._closed and self._saved_generation < self._save_generation:
                 generation = self._save_generation
                 await self.save()
                 self._saved_generation = max(self._saved_generation, generation)
         finally:
             self._save_task = None
-            if self._saved_generation < self._save_generation:
+            if not self._closed and self._saved_generation < self._save_generation:
                 self.schedule_save(mark_dirty=False)
 
     def schedule_save(self, *, mark_dirty: bool = True) -> None:
+        if self._closed:
+            return
         if mark_dirty:
             self._save_generation += 1
         loop: asyncio.AbstractEventLoop | None = None
@@ -623,6 +637,29 @@ class _OpenAgentLifecycleMixin:
         await self._load_todo_items_storage()
         await self._load_installed_plugins()
         self.log.info("OpenAgent loaded")
+
+    async def on_unload(self) -> None:
+        """Release deferred session/background tasks before the event loop stops."""
+
+        manager = getattr(self, "session_manager", None)
+        if manager is not None:
+            with contextlib.suppress(Exception):
+                if manager._saved_generation < manager._save_generation:
+                    await manager.save()
+                    manager._saved_generation = manager._save_generation
+            await manager.close()
+
+        tasks = list(getattr(self, "_background_tool_tasks", {}).values())
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for waiters_name in ("_inline_status_waiters", "_tool_confirmation_waiters"):
+            for future in getattr(self, waiters_name, {}).values():
+                if future is not None and not future.done():
+                    future.cancel()
+        await super().on_unload()
 
 
 class OpenAgentProviderService:

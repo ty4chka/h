@@ -372,6 +372,11 @@ class LogBot(ModuleBase):
             )
 
     async def setup_log_chat(self):
+        # NullTransport intentionally has no Telegram RPC surface.  Keep the
+        # module lifecycle usable in an offline compatibility run without
+        # pretending that a log chat or bot client can be provisioned.
+        if getattr(self.kernel, "is_offline", False):
+            return False
 
         if self.kernel.config.get("log_chat_id"):
             self.kernel.log_chat_id = self.kernel.config["log_chat_id"]
