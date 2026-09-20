@@ -774,6 +774,186 @@ class ModuleBase:
             return self.inline(label, handler or on_close, allow_user=allow_user,
                                allow_ttl=allow_ttl, style=style, icon=icon)
 
+        # ---- дополнительные типы кнопок MCUB-fork ----
+
+        def copy(self, text="Copy", copy_text=None, *, icon=None, style=None):
+            """Кнопка «скопировать» (Telethon-MCUB Button.copy; fallback — answer)."""
+            from telethon import Button as TButton
+
+            factory = getattr(TButton, "copy", None)
+            if callable(factory):
+                return factory(text, copy_text=copy_text)
+
+            async def _answer_copy(event, *_a, **_kw):
+                try:
+                    await event.answer(f"📋 {copy_text or ''}")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return self.inline(text, _answer_copy)
+
+        def request_phone(self, text="Share Phone", *, request_title=None, icon=None, style=None):
+            from telethon import Button as TButton
+
+            factory = getattr(TButton, "request_phone", None)
+            if callable(factory):
+                return factory(text)
+            return {"text": text}
+
+        def request_location(self, text="Share Location", *, request_title=None,
+                             live_period=None, icon=None, style=None):
+            from telethon import Button as TButton
+
+            factory = getattr(TButton, "request_location", None)
+            if callable(factory):
+                return factory(text)
+            return {"text": text}
+
+        def request_poll(self, text="Create Poll", *, request_title=None, quiz=False,
+                         icon=None, style=None):
+            from telethon import Button as TButton
+
+            factory = getattr(TButton, "request_poll", None)
+            if callable(factory):
+                return factory(text)
+            return {"text": text}
+
+        def game(self, text, *, game=None, icon=None, style=None):
+            from telethon import Button as TButton
+
+            factory = getattr(TButton, "game", None)
+            if callable(factory):
+                return factory(text)
+            return {"text": text}
+
+        def unknown(self, data: bytes, text="Button", *, icon=None, style=None):
+            from telethon import Button as TButton
+
+            if isinstance(data, str):
+                data = data.encode()
+            return TButton.inline(text, data=data)
+
+        def with_icon(self, btn, icon):
+            """DEPRECATED в MCUB-fork: используйте параметр icon напрямую."""
+            return btn
+
+        def style(self, btn, style):
+            """DEPRECATED в MCUB-fork: используйте параметр style напрямую."""
+            return btn
+
+        def rich(self):
+            """Button.rich() — фабрика кнопок rich-страниц Telegram (MCUB-fork)."""
+            return self._outer.RichButtonFactory(self._outer)
+
+    class RichButtonFactory:
+        """Фабрика кнопок «rich-страниц» (core.lib.rich_buttons MCUB-fork).
+
+        Спеки используют обычный inline-callback-map, поэтому TTL,
+        allow_user и чистка при выгрузке модуля сохраняются.
+        """
+
+        def __init__(self, outer):
+            self._outer = outer
+
+        def inline(self, text, handler, *, args=(), kwargs=None, ttl=900,
+                   allow_user=None, allow_ttl=100, data=None, pass_event=True,
+                   auto_answer=None, icon=None, style=None, html_tag=False,
+                   **button_kwargs):
+            from core.lib.rich_buttons import (
+                RichCallbackButton,
+                render_rich_button,
+                validate_rich_button,
+            )
+
+            spec = self._outer._make_callback_button(
+                text, handler, ttl=ttl, allow_user=allow_user, allow_ttl=allow_ttl,
+                args=args, kwargs=kwargs, data=data, pass_event=pass_event,
+                auto_answer=auto_answer,
+            )
+            token = (
+                getattr(spec, "data", None)
+                or getattr(spec, "token", None)
+                or (spec.get("data") if isinstance(spec, dict) else None)
+            )
+            if isinstance(token, bytes):
+                token = token.decode()
+            validate_rich_button(text, str(token), style if style in self._STYLES else None)
+            rich_button = RichCallbackButton(
+                text, str(token), style=style if style in self._STYLES else None
+            )
+            return render_rich_button(rich_button) if html_tag else rich_button
+
+        _STYLES = frozenset({"primary", "danger", "success", "link"})
+        _ALIGNMENTS = frozenset({"left", "center", "right"})
+
+        def row(self, *buttons, align="center"):
+            from core.lib.rich_buttons import (
+                RichButtonRow,
+                RichCallbackButton,
+                RichPageButton,
+            )
+
+            if align not in self._ALIGNMENTS:
+                raise ValueError("rich button row align must be left, center or right")
+            if not buttons:
+                raise ValueError("rich button row cannot be empty")
+            if len(buttons) > 8:
+                raise ValueError("rich button rows support at most 8 buttons")
+            if not all(isinstance(b, (RichCallbackButton, RichPageButton)) for b in buttons):
+                raise TypeError("rich button rows accept only Button.rich.inline specs")
+            return RichButtonRow(tuple(buttons), align=align)
+
+        def _page(self, text, type_, attrs=None, style=None, html_tag=False):
+            from core.lib.rich_buttons import (
+                RichPageButton,
+                render_rich_page_button,
+                validate_rich_page_button,
+            )
+
+            button = RichPageButton(text, type_, attrs, style)
+            validate_rich_page_button(button)
+            return render_rich_page_button(button) if html_tag else button
+
+        def url(self, text, url, *, style=None, html_tag=False):
+            return self._page(text, "url", {"url": url}, style, html_tag)
+
+        def text(self, text, *, style=None, html_tag=False):
+            return self._page(text, "text", None, style, html_tag)
+
+        def switch(self, text, query="", *, same_peer=True, style=None, html_tag=False):
+            return self._page(text, "switch", {"query": query}, style, html_tag)
+
+        def copy(self, text="Copy", copy_text=None, *, style=None, html_tag=False):
+            return self._page(text, "copy", {"copy_text": copy_text or ""}, style, html_tag)
+
+        def game(self, text="Play Game", *, style=None, html_tag=False):
+            return self._page(text, "game", None, style, html_tag)
+
+        def unknown(self, text="Unsupported", *, style=None, html_tag=False):
+            return self._page(text, "unknown", None, style, html_tag)
+
+        def input(self, text, handler, *, placeholder="", ttl=900, allow_user=None,
+                  allow_ttl=100, icon=None, style=None, **kw):
+            return self._outer._button_factory.input(
+                text, handler, placeholder=placeholder, ttl=ttl,
+                allow_user=allow_user, allow_ttl=allow_ttl,
+            )
+
+        def close(self, text=None, **kw):
+            return self.text(text or "Close")
+
+        def request_phone(self, *args, **kwargs):
+            raise NotImplementedError("request buttons недоступны в rich-фабрике")
+
+        def request_location(self, *args, **kwargs):
+            raise NotImplementedError("request buttons недоступны в rich-фабрике")
+
+        def request_poll(self, *args, **kwargs):
+            raise NotImplementedError("request buttons недоступны в rich-фабрике")
+
+        def with_icon(self, *args, **kwargs):
+            raise NotImplementedError("иконки недоступны в rich-фабрике")
+
     # --------------------------------------------------------
     # ХЕЛПЕРЫ (как в MCUB)
     # --------------------------------------------------------

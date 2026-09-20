@@ -20,6 +20,7 @@ import re
 import time
 import types
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -324,6 +325,13 @@ class _McubLoaderView:
             return names
         names.add(str(getattr(module, "name", "")))
         names.add(str(getattr(type(module), "__module__", "")))
+        # Пакетный модуль (любой python-module): команды привязаны через
+        # __owner_module__ маркер на обёртках (core_style и т.п.).
+        pkg_name = getattr(module, "__name__", None)
+        if pkg_name:
+            names.add(str(pkg_name))
+            if str(pkg_name).startswith("modules."):
+                names.add(str(pkg_name).rsplit(".", 1)[-1])
         for name, instance in self.kernel._class_module_instances.items():
             if instance is module:
                 names.add(str(name))
@@ -357,6 +365,32 @@ class _McubLoaderView:
             for command, owner in self.kernel.command_owners.items()
             if str(owner) in names
         ]
+        # Нативные Hydra-модули регистрируются минуя MCUB register_command —
+        # их обработчики помечены __bound_instance__ в lifecycle. Без этого
+        # man показывал «no commands» для control/cfg/ping и т.п.
+        module_obj = self.kernel.lookup_module(module_name)
+        for command, handler in self.kernel.h.command_handlers.items():
+            if command in commands:
+                continue
+            # core-style функциональные модули помечаются __owner_module__
+            owner_name = getattr(handler, "__owner_module__", None)
+            if owner_name and str(owner_name) in names:
+                commands.append(command)
+                continue
+            # setup-функциональные модули: их хэндлеры сами живут в modules.X
+            handler_module = str(getattr(handler, "__module__", "") or "")
+            if handler_module and handler_module in names:
+                commands.append(command)
+                continue
+            bound = getattr(handler, "__bound_instance__", None) or getattr(handler, "__self__", None)
+            if bound is None:
+                continue
+            bound_names = {
+                str(getattr(bound, "name", "")),
+                str(getattr(type(bound), "__module__", "")),
+            }
+            if bound is module_obj or bound_names & names:
+                commands.append(command)
         aliases_info: dict[str, list[str]] = {}
         for alias, command in self.kernel.aliases.items():
             if command in commands:
@@ -379,8 +413,105 @@ class _McubLoaderView:
                 )
                 break
             else:
-                descriptions[command] = ""
+                # Нативная команда: doc живёт в метаданных декоратора ядра.
+                doc = getattr(original, "__doc__", None) or ""
+                descriptions[command] = doc.strip().splitlines()[0] if doc.strip() else ""
         return commands, aliases_info, descriptions
+
+    # -- поверхность loader-view MCUB-fork (modules/loader.py) --
+
+    @staticmethod
+    def _sanitize_module_name(value: Any) -> str:
+        name = re.sub(r"[^\w\-.]", "_", str(value or "module")).strip("._")
+        return name or "module"
+
+    def get_user_module_install_path(self, module_name: str) -> str:
+        """Путь установки пользовательского модуля (MODULES_LOADED_DIR)."""
+
+        base = Path(getattr(self.kernel, "MODULES_LOADED_DIR", "modules_loaded"))
+        return str(base / f"{self._sanitize_module_name(module_name)}.py")
+
+    def find_module_case_insensitive(self, name: str) -> tuple[Any, Any]:
+        """(actual_name, 'loaded'|'system') без учёта регистра."""
+
+        needle = str(name).lower()
+        for key in self.kernel.loaded_modules:
+            if str(key).lower() == needle:
+                return key, "loaded"
+        for key in self.kernel.system_modules:
+            if str(key).lower() == needle:
+                return key, "system"
+        return None, None
+
+    async def get_module_version_from_file(self, file_path: str) -> Optional[str]:
+        try:
+            source = Path(file_path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', source)
+        if match:
+            return match.group(1)
+        metadata = await self.kernel.get_module_metadata(source)
+        return metadata.get("version")
+
+    def remove_module_aliases(self, module_name: str, *_args: Any, **_kw: Any) -> int:
+        removed = 0
+        for alias, target in list(self.kernel.h.aliases.items()):
+            if target == module_name:
+                self.kernel.h.aliases.pop(alias, None)
+                removed += 1
+        return removed
+
+    @staticmethod
+    def is_archive_url(url: str) -> bool:
+        lowered = str(url).lower().split("?", 1)[0]
+        return lowered.endswith((".zip", ".tar.gz", ".tgz", ".tar"))
+
+    def parse_requires(self, code: str) -> list:
+        """``# requires: pkg1, pkg2`` + class-style ``dependencies = [...]``."""
+
+        requirements: list[str] = []
+        for match in re.finditer(r"^\s*#\s*requires\s*:\s*(.+)$", code, re.MULTILINE | re.IGNORECASE):
+            requirements.extend(
+                part for part in re.split(r"[,\s]+", match.group(1).strip()) if part
+            )
+        for match in re.finditer(r"^\s*dependencies\s*=\s*\[(.*?)\]", code, re.DOTALL):
+            requirements.extend(
+                item.strip().strip("'\"")
+                for item in match.group(1).split(",")
+                if item.strip().strip("'\"")
+            )
+        seen: set = set()
+        unique = []
+        for req in requirements:
+            if req not in seen:
+                seen.add(req)
+                unique.append(req)
+        return unique
+
+    async def install_dependency(self, dep: str) -> tuple:
+        return await self.kernel.install_dependencies_batch([dep])
+
+    async def load_module_from_file(self, file_path: Any, module_name: Optional[str] = None) -> Tuple[bool, str]:
+        return await self.kernel.load_module_from_file(file_path, module_name)
+
+    async def install_from_archive(self, archive_path: Any, module_name: Optional[str] = None) -> Tuple[bool, str]:
+        """Распаковать архив и загрузить первый .py через безопасный пайплайн."""
+
+        import tempfile
+
+        from utils.security import safe_extract_archive
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="hydra_archive_") as temp_dir:
+                safe_extract_archive(str(archive_path), temp_dir)
+                candidates = sorted(Path(temp_dir).rglob("*.py"))
+                if not candidates:
+                    return False, "в архиве нет .py-модулей"
+                target = candidates[0]
+                return await self.load_module_from_file(target, module_name or target.stem)
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)[:300]
 
 
 class KernelRegister:
@@ -413,6 +544,32 @@ class KernelRegister:
             return fn
 
         return args[0] if args and callable(args[0]) else deco
+
+    def method(self, func: Optional[Callable] = None, **_kw: Any) -> Callable:
+        """@kernel.register.method — setup-функция, вызывается при загрузке.
+
+        В MCUB-fork метод получает kernel сразу после register(kernel).
+        Адаптер собирает их в текущий scope и вызывает с интерфейсом.
+        """
+
+        def deco(fn: Callable) -> Callable:
+            if self._iface._scope_stack:
+                owner = self._iface._scope_stack[-1].source_name
+                self._iface._pending_methods.setdefault(owner, []).append(fn)
+            return fn
+
+        if func is None:
+            return deco
+        return deco(func)
+
+    def on_install(self, *args: Any, **_kw: Any) -> Callable:
+        """register.on_install — как и в MCUB-fork, install-хук при первом запуске.
+
+        Единый движок не ведёт учёт «первой установки», поэтому install-хуки
+        вызываются при каждой загрузке, как и on_load.
+        """
+
+        return self.on_load(*args, **_kw)
 
     def uninstall(self, *args: Any, **kw: Any) -> Callable:
         return self.on_unload(*args, **kw)
@@ -530,6 +687,234 @@ class KernelRegister:
             outgoing=True,
         )
 
+    # ------------------------------------------------------------------
+    # Запросы/снятие обработчиков (New methods v1.0.3 MCUB-fork)
+    # ------------------------------------------------------------------
+
+    def get_registered_methods(self) -> dict:
+        """Зарегистрированные @kernel.register.method функции по модулям."""
+
+        return {
+            owner: {getattr(fn, "__name__", "method"): fn for fn in fns}
+            for owner, fns in self._iface._pending_methods.items()
+        }
+
+    def get_commands(self) -> dict:
+        return dict(self._iface.h.command_handlers)
+
+    def get_command(self, command: str) -> dict:
+        name = str(command)
+        handler = self._iface.h.command_handlers.get(name)
+        if handler is None:
+            return {}
+        return {
+            "handler": handler,
+            "owner": self._iface.command_owners.get(name),
+            "aliases": [
+                alias for alias, target in self._iface.h.aliases.items() if target == name
+            ],
+        }
+
+    def get_bot_commands(self) -> dict:
+        return {
+            name: (name, handler)
+            for name, handler in getattr(self._iface.h, "bot_commands", {}).items()
+        }
+
+    def get_watchers(self) -> list:
+        return [
+            {
+                "module": entry["module"],
+                "name": entry["name"],
+                "handler": entry["handler"],
+                "enabled": entry["enabled"],
+                **entry["options"],
+            }
+            for entry in self._iface._watcher_registry
+        ]
+
+    def disable_watcher(self, module_name: str, watcher_name: str) -> bool:
+        for entry in self._iface._watcher_registry:
+            if entry["module"] == str(module_name) and entry["name"] == str(watcher_name):
+                entry["enabled"] = False
+                return True
+        return False
+
+    def enable_watcher(self, module_name: str, watcher_name: str) -> bool:
+        for entry in self._iface._watcher_registry:
+            if entry["module"] == str(module_name) and entry["name"] == str(watcher_name):
+                entry["enabled"] = True
+                return True
+        return False
+
+    def get_events(self) -> list:
+        return [(entry["handler"], entry["options"], ()) for entry in self._iface._watcher_registry]
+
+    def get_loops(self) -> list:
+        return list(getattr(self._iface, "_loops", []))
+
+    def unregister_command(self, cmd: str) -> bool:
+        name = str(cmd)
+        existed = self._iface.h.command_handlers.pop(name, None) is not None
+        self._iface.command_owners.pop(name, None)
+        for alias, target in list(self._iface.h.aliases.items()):
+            if target == name:
+                self._iface.h.aliases.pop(alias, None)
+        return existed
+
+    def unregister_bot_command(self, cmd: str) -> bool:
+        name = str(cmd)
+        existed = getattr(self._iface.h, "bot_commands", {}).pop(name, None) is not None
+        if hasattr(self._iface, "_bot_command_owners"):
+            self._iface._bot_command_owners.pop(name, None)
+        return existed
+
+    def get_all_aliases(self) -> dict:
+        return dict(self._iface.h.aliases)
+
+    def get_command_alias(self, command: str) -> Optional[str]:
+        name = str(command)
+        for alias, target in self._iface.h.aliases.items():
+            if target == name:
+                return alias
+        return None
+
+    def get_use_bot(self) -> dict:
+        return {}
+
+    def owner(self, func: Optional[Callable] = None, only_admin: bool = False) -> Callable:
+        """@kernel.register.owner — обработчик только для владельца."""
+
+        def deco(fn: Callable) -> Callable:
+            iface = self._iface
+
+            async def wrapper(event: Any, *args: Any, **kwargs: Any) -> Any:
+                if not iface.is_admin(getattr(event, "sender_id", 0)):
+                    return None
+                result = fn(event, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            wrapper.__original__ = fn  # type: ignore[attr-defined]
+            return wrapper
+
+        if func is None:
+            return deco
+        return deco(func)
+
+
+class _InlineNS:
+    """``kernel.inline``/``kernel._inline`` — поверхность InlineManager MCUB-fork.
+
+    У юзербота нет настоящего инлайн-бота, поэтому form/query/сессии идут
+    через текстовый мост кнопок и локальный роутер инлайн-хендлеров ядра.
+    """
+
+    def __init__(self, iface: "McubKernelInterface") -> None:
+        self._iface = iface
+        self._sessions: dict[str, tuple[Any, float]] = {}
+
+    # -- формы и запросы --
+    async def form(self, chat_id: Any, title: Any = None, **kw: Any) -> Tuple[bool, Any]:
+        return await self._iface.inline_form(chat_id, title, **kw)
+
+    async def query(self, chat_id: Any, query: str, **kw: Any) -> Tuple[bool, Any]:
+        return await self._iface.inline_query_and_click(chat_id, query, **kw)
+
+    async def send_inline(self, chat_id: Any, query: str, buttons: Any = None, **kw: Any) -> Tuple[bool, Any]:
+        ok, result = await self._iface.inline_query_and_click(chat_id, query, **kw)
+        return ok, result
+
+    async def inline_form(self, chat_id: Any, title: Any = None, **kw: Any) -> Tuple[bool, Any]:
+        return await self.form(chat_id, title, **kw)
+
+    async def rich_form(self, chat_id: Any, rich_text: Any = None, **kw: Any) -> Tuple[bool, Any]:
+        # rich-разметка сводится к HTML-тексту + обычным кнопкам моста.
+        text = kw.pop("text", None) or (rich_text if isinstance(rich_text, str) else "")
+        buttons = kw.pop("buttons", None) or (None if isinstance(rich_text, str) else rich_text)
+        return await self._iface.inline_form(chat_id, text, buttons=buttons, **kw)
+
+    async def inline_query_and_click(self, chat_id: Any, query: str, **kw: Any) -> Tuple[bool, Any]:
+        return await self._iface.inline_query_and_click(chat_id, query, **kw)
+
+    # -- обработчики --
+    def register_inline_handler(self, name: str, handler: Callable) -> None:
+        self._iface.register_inline_handler(name, handler)
+
+    def unregister_module_inline_handlers(self, module_name: str) -> None:
+        owner_key = str(module_name)
+        live = getattr(self._iface.h, "inline_handlers", {})
+        for name, owner in list(self._iface._inline_owners.items()):
+            if owner == owner_key:
+                self._iface._inline_owners.pop(name, None)
+                if live.get(name) is not None:
+                    live.pop(name, None)
+
+    def register_callback_handler(self, prefix: Any, handler: Callable) -> None:
+        self._iface.register_callback_handler(prefix, handler)
+
+    def get_module_inline_commands(self, module_name: str) -> list:
+        return self._iface.get_module_inline_commands(module_name)
+
+    # -- сессии каталога (loader.py: catalog_search:<id>) --
+    def _session_put(self, key: str, data: Any, ttl: int = 300) -> None:
+        self._sessions[str(key)] = (data, time.time() + float(ttl or 300))
+        if len(self._sessions) > 200:
+            now = time.time()
+            for skey, (_value, expires) in list(self._sessions.items()):
+                if expires <= now:
+                    self._sessions.pop(skey, None)
+
+    def _session_get(self, key: str, *, pop: bool = False, default: Any = None) -> Any:
+        item = self._sessions.get(str(key))
+        if item is None:
+            return default
+        value, expires = item
+        if expires <= time.time():
+            self._sessions.pop(str(key), None)
+            return default
+        if pop:
+            self._sessions.pop(str(key), None)
+        return value
+
+
+class _LogNS:
+    """``kernel._log`` — LogManager MCUB-fork: события в лог-чат + файл."""
+
+    def __init__(self, iface: "McubKernelInterface") -> None:
+        self._iface = iface
+
+    async def log(self, message: str, emoji: str = "ℹ️") -> None:
+        await self._iface.send_log_message(f"{emoji} {message}")
+
+    async def log_network(self, message: str) -> None:
+        await self.log(message, "🌐")
+
+    async def log_error_async(self, message: str) -> None:
+        await self.log(message, "🔴")
+
+    async def log_module(self, message: str) -> None:
+        await self.log(message, "⚙️")
+
+    async def send_log_message(self, text: str, file: Any = None) -> bool:
+        return await self._iface.send_log_message(text, file=file)
+
+    async def send_error_log(self, error_text: str, source_file: str, message_info: str = "") -> None:
+        await self._iface.send_error_log(error_text, source_file, message_info)
+
+    async def handle_error(self, error: Exception, source: str = "unknown", **kw: Any) -> None:
+        await self._iface.handle_error(error, source=source, **kw)
+
+    def save_error_to_file(self, error_text: str) -> None:
+        try:
+            path = Path(self._iface.LOGS_DIR) / "kernel.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_text}\n")
+        except OSError:  # pragma: no cover - логи не должны ронять модули
+            pass
+
 
 class McubKernelInterface:
     """То, что MCUB-модуль видит как `kernel` (по kernel.md MCUB-fork)."""
@@ -569,9 +954,34 @@ class McubKernelInterface:
         self._user_emoji: dict[Any, Any] = {}
         self.command_owners: dict[str, str] = {}
         self._inline_owners: dict[str, str] = {}
+        self._watcher_registry: list[dict[str, Any]] = []
+        self._pending_methods: dict[str, list[Callable]] = {}
         self._scope_stack: list[_RegistrationScope] = []
         self._loader = _McubLoaderView(self)
         self.log_chat_id = self.config.get("log_chat_id")
+        # --- Поверхность kernel.md MCUB-fork: runtime-состояние и пути ---
+        self.catalog_cache: dict[str, Any] = {}
+        self.pending_confirmations: dict[str, Any] = {}
+        self.shutdown_flag = False
+        self.power_save_mode = False
+        self.owner_prefixes: dict[str, str] = {}
+        self.IMG_DIR = "img"
+        self.LOGS_DIR = "logs"
+        self.CONFIG_FILE = "config.json"
+        self.ERROR_FILE = "crash.tmp"
+        self.RESTART_FILE = "restart.tmp"
+        self.DB_VERSION = 1
+        self.MODULES_REPO = (
+            "https://raw.githubusercontent.com/hairpin01/repo-MCUB-fork/main/"
+        )
+        self.UPDATE_REPO = "https://raw.githubusercontent.com/hairpin01/MCUB-fork/main/"
+        self.default_repo = self.MODULES_REPO
+        # Репозитории модулей живут в data/module_repos.json, чтобы/.addrepo
+        # переживал перезапуск; загружаем лениво при первом обращении.
+        self._repositories: Optional[list[str]] = None
+        self._module_sources_store: Optional[dict[str, dict[str, Any]]] = None
+        self._inline = _InlineNS(self)
+        self._log = _LogNS(self)
         self.register = KernelRegister(self)
         # kernel-уровневая фабрика кнопок (без привязки к модулю)
         self.Button = ButtonFactory(types.SimpleNamespace(name="kernel", ctx=None))
@@ -633,7 +1043,22 @@ class McubKernelInterface:
         # Класс попадает сюда ещё до registry.register(), поэтому on_load одного
         # MCUB-модуля может require_module() другой модуль той же волны.
         records = {n: r.module for n, r in self._records().items()}
-        return {**records, **self._class_module_instances}
+        merged = dict(records)
+        for key, instance in self._class_module_instances.items():
+            # Тот же instance уже есть под техническим именем реестра
+            # («openagent_mcub_repo»): предпочитаем «человеческое» имя класса
+            # («OpenAgent»), чтобы man/hmods показывали читаемые имена без
+            # дублей-алиасов.
+            dup_names = [
+                rec_name
+                for rec_name, module in records.items()
+                if module is instance and rec_name != key
+            ]
+            for rec_name in dup_names:
+                merged.pop(rec_name, None)
+            if key not in merged:
+                merged[key] = instance
+        return merged
 
     @property
     def system_modules(self) -> dict:
@@ -700,6 +1125,11 @@ class McubKernelInterface:
 
             async def wrapper(event: Any, _h=handler, _cmd=command_name) -> None:
                 try:
+                    # Команда MCUB получает нормализованный Message: учим его
+                    # edit/reply/respond рендерить Button-объекты Telethon,
+                    # иначе мост кнопок регистрирует меню с 0 кнопок
+                    # (наблюдалось как «Кнопка #1 не найдена в меню #N (всего 0)»).
+                    self._prepare_callback_event(event)
                     result = _h(event)
                     if inspect.isawaitable(result):
                         await result
@@ -754,8 +1184,17 @@ class McubKernelInterface:
         instance = getattr(handler, "__bound_instance__", None) or getattr(handler, "__self__", None)
         owner = getattr(instance, "name", None) or getattr(original, "__module__", "mcub")
         handler_name = getattr(original, "__name__", getattr(handler, "__name__", "watcher"))
+        entry = {
+            "module": str(owner),
+            "name": str(handler_name),
+            "handler": handler,
+            "options": {k: v for k, v in kw.items() if k in {"pattern", "incoming", "outgoing", "chats"}},
+            "enabled": True,
+        }
 
-        async def wrapper(event: Any) -> None:
+        async def wrapper(event: Any, _entry=entry) -> None:
+            if not _entry["enabled"]:
+                return
             try:
                 result = handler(event)
                 if inspect.isawaitable(result):
@@ -766,8 +1205,16 @@ class McubKernelInterface:
         # Transport telemetry uses __qualname__; retain the actual module and
         # watcher name instead of the opaque register_watcher.<locals>.wrapper.
         wrapper.__qualname__ = f"MCUB.{owner}.{handler_name}"
-        options = {k: v for k, v in kw.items() if k in {"pattern", "incoming", "outgoing", "chats"}}
-        self._track_cleanup(self.h.transport.subscribe(wrapper, **options))
+        entry["wrapper"] = wrapper
+        self._watcher_registry.append(entry)
+        unsubscribe = self.h.transport.subscribe(wrapper, **entry["options"])
+
+        def cleanup(_entry=entry, _unsubscribe=unsubscribe) -> None:
+            _unsubscribe()
+            if _entry in self._watcher_registry:
+                self._watcher_registry.remove(_entry)
+
+        self._track_cleanup(cleanup)
 
     def register_inline_handler(self, name: str, handler: Callable) -> None:
         missing = object()
@@ -819,6 +1266,13 @@ class McubKernelInterface:
         missing = object()
         previous = self.h.bot_commands.get(name, missing)
         self.h.bot_commands[name] = handler
+        if not hasattr(self, "_bot_command_owners"):
+            self._bot_command_owners: dict[str, str] = {}
+        original = getattr(handler, "__original__", handler)
+        instance = getattr(handler, "__bound_instance__", None) or getattr(handler, "__self__", None)
+        owner = getattr(instance, "name", None) or getattr(original, "__module__", "mcub")
+        previous_owner = self._bot_command_owners.get(name, missing)
+        self._bot_command_owners[name] = str(owner)
 
         def cleanup() -> None:
             if self.h.bot_commands.get(name) is handler:
@@ -826,6 +1280,11 @@ class McubKernelInterface:
                     self.h.bot_commands.pop(name, None)
                 else:
                     self.h.bot_commands[name] = previous
+            if self._bot_command_owners.get(name) == str(owner):
+                if previous_owner is missing:
+                    self._bot_command_owners.pop(name, None)
+                else:
+                    self._bot_command_owners[name] = previous_owner
 
         self._track_cleanup(cleanup)
 
@@ -881,7 +1340,13 @@ class McubKernelInterface:
         n = 0
         for row in buttons:
             if not isinstance(row, (list, tuple)):
-                row = [row]
+                # RichButtonRow (core.lib.rich_buttons) — разворачиваем его
+                # кнопки одной строкой.
+                row_buttons = getattr(row, "buttons", None)
+                if row_buttons is not None and not hasattr(row, "text"):
+                    row = list(row_buttons)
+                else:
+                    row = [row]
             out = []
             for btn in row:
                 if isinstance(btn, dict):
@@ -918,10 +1383,61 @@ class McubKernelInterface:
                     else:
                         out.append(btn)
                     continue
+                # Telethon-объекты: KeyboardButtonCallback (data=bytes),
+                # KeyboardButtonUrl (url=...), KeyboardButtonSwitchInline
+                # (query=...), Button-spec (RichCallbackButton и т.п.), а также
+                # офлайн-шим Button (kwargs с url/query).
+                inner = getattr(btn, "button", btn)
+                btn_kwargs = getattr(btn, "kwargs", None)
+                if not isinstance(btn_kwargs, dict):
+                    btn_kwargs = {}
+                text = (
+                    getattr(btn, "text", None)
+                    or getattr(inner, "text", None)
+                    or str(btn)
+                )
+                # RichPageButton (core.lib.rich_buttons): text/type/attrs.
+                page_type = getattr(btn, "type", None)
+                if page_type is not None and not hasattr(btn, "button") and not hasattr(btn, "data") and getattr(btn, "token", None) is None:
+                    page_attrs = getattr(btn, "attrs", None)
+                    if not isinstance(page_attrs, dict):
+                        page_attrs = {}
+                    if page_type == "url" and page_attrs.get("url"):
+                        out.append({"text": text, "url": str(page_attrs["url"])})
+                    elif page_type == "switch" or page_type == "query":
+                        out.append({"text": text, "query": str(page_attrs.get("query", ""))})
+                    elif page_type == "copy" and page_attrs.get("copy_text"):
+                        async def _answer_copy(call, _txt=str(page_attrs["copy_text"]), _t=text):
+                            try:
+                                await call.answer(f"📋 {_txt}")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        n += 1
+                        token = f"mcub_cb{n}:copy_{n}"
+                        self.h.register_callback(token, _answer_copy)
+                        out.append({"text": text, "data": token})
+                    else:
+                        out.append({"text": text})
+                    continue
+                url = (
+                    getattr(inner, "url", None)
+                    or getattr(btn, "url", None)
+                    or btn_kwargs.get("url")
+                )
+                if url:
+                    # Кнопка-ссылка: мост кнопок отрисует её как «↗ текст: url».
+                    out.append({"text": text, "url": str(url)})
+                    continue
                 data = getattr(btn, "data", None)
                 if data is None:
+                    data = getattr(inner, "data", None)
+                if data is None:
                     data = getattr(getattr(btn, "type", None), "data", None)
-                text = getattr(btn, "text", str(btn))
+                if data is None and getattr(btn, "token", None) is not None:
+                    # RichCallbackButton-совместимые спеки хранят токен отдельно.
+                    data = getattr(btn, "token")
+                if isinstance(data, str):
+                    data = data.encode()
                 if isinstance(data, bytes):
                     src_tok = data.decode()
                     n += 1
@@ -931,6 +1447,16 @@ class McubKernelInterface:
                         self._prepare_callback_event(call)
                         entry = getattr(self, "inline_callback_map", {}).get(_tok)
                         if not entry:
+                            # «Сырые» data-кнопки (Button.inline("x", data=b"..."))
+                            # обрабатывает общий реестр по префиксу data —
+                            # kernel.register_callback_handler() MCUB-fork.
+                            await self.h._on_callback(
+                                _tok,
+                                getattr(call, "sender_id", self.h.owner_id),
+                                getattr(call, "chat_id", None) or 0,
+                                getattr(call, "message_id", 0) or 0,
+                                None,
+                            )
                             return
                         kwargs = dict(entry.get("kwargs", {}))
                         if entry.get("data") is not None and "data" not in kwargs:
@@ -951,37 +1477,106 @@ class McubKernelInterface:
 
                     self.h.register_callback(token, _cb)
                     out.append({"text": text, "data": token})
+                    continue
+                query = getattr(inner, "query", None)
+                if query is None:
+                    query = getattr(btn, "query", None)
+                if query is None:
+                    query = btn_kwargs.get("query")
+                if query is not None:
+                    # switch-inline: у юзербота нет инлайн-бота — мост смапит
+                    # запрос на локальный .iq-поиск.
+                    out.append({"text": text, "query": str(query)})
                 else:
                     out.append({"text": text})
             rows.append(out)
         return rows
 
     def _prepare_callback_event(self, event: Any) -> Any:
-        """Teach a generic Hydra callback event to render MCUB buttons.
+        """Teach a generic Hydra event to render MCUB buttons.
 
-        A module callback receives :class:`CallbackQueryEvent`, not the
-        interface that created its Telethon-style ``Button`` objects.  Bind a
-        one-shot edit adapter before executing it so ``event.edit(...,
-        buttons=[Button.inline(...)])`` keeps its callbacks and text bridge.
+        A module handler receives :class:`CallbackQueryEvent`/:class:`Message`,
+        not the interface that created its Telethon-style ``Button`` objects.
+        Bind one-shot adapters around every text-sending method so
+        ``event.edit(..., buttons=[Button.inline(...)])`` (команды и колбэки),
+        ``event.reply(...)`` и ``event.respond(...)`` сохраняют колбэки, ссылки
+        и текстовый мост кнопок.
         """
 
         if getattr(event, "_mcub_button_iface", None) is self:
             return event
-        original_edit = getattr(event, "edit", None)
-        if not callable(original_edit):
-            return event
 
-        async def edit(text: str, **kw: Any) -> Any:
-            if "buttons" in kw:
-                kw["buttons"] = self._normalize_buttons(kw["buttons"])
-            return await original_edit(text, **kw)
+        # Real Telethon CallbackQueryEvent.data — всегда bytes. MCUB-модули
+        # сравнивают data с байтовыми константами (``data == b"approve_yes"``,
+        # ``data.startswith(b"api_prot_mode_")``); Hydra-ядро таскает str.
+        # Нормализуем один раз при подготовке события для MCUB-хэндлера,
+        # сохранив исходное str-значение для answer() на уровне транспорта.
+        event_data = getattr(event, "data", None)
+        orig_data = event_data if isinstance(event_data, str) else None
+        if isinstance(event_data, str):
+            try:
+                event.data = event_data.encode()
+            except (AttributeError, ValueError):
+                orig_data = None
 
+        def _wrap(method: Any) -> Any:
+            if not callable(method):
+                return None
+
+            async def wrapped(text: str = "", *args: Any, **kw: Any) -> Any:
+                if kw.get("buttons") is not None:
+                    kw["buttons"] = self._normalize_buttons(kw["buttons"])
+                return await method(text, *args, **kw)
+
+            return wrapped
+
+        bound = False
+        for attr in ("edit", "reply", "respond"):
+            original = getattr(event, attr, None)
+            wrapped = _wrap(original)
+            if wrapped is None:
+                continue
+            try:
+                setattr(event, attr, wrapped)
+                bound = True
+            except Exception:  # pragma: no cover - immutable third-party event
+                pass
+        answer_original = getattr(event, "answer", None)
+        if callable(answer_original):
+            async def wrapped_answer(text: str = "", *args: Any, **kw: Any) -> Any:
+                data = getattr(event, "data", None)
+                restored = orig_data is not None and isinstance(data, bytes)
+                if restored:
+                    with suppress(Exception):
+                        event.data = orig_data
+                try:
+                    return await answer_original(text, *args, **kw)
+                finally:
+                    if restored:
+                        with suppress(Exception):
+                            event.data = data
+            try:
+                setattr(event, "answer", wrapped_answer)
+                bound = True
+            except Exception:  # pragma: no cover
+                pass
+
+        bound = False
+        for attr in ("edit", "reply", "respond", "answer"):
+            original = getattr(event, attr, None)
+            wrapped = _wrap(original)
+            if wrapped is None:
+                continue
+            try:
+                setattr(event, attr, wrapped)
+                bound = True
+            except Exception:  # pragma: no cover - immutable third-party event
+                pass
         try:
-            event.edit = edit
             event._mcub_button_iface = self
-        except Exception:  # pragma: no cover - immutable third-party event
+        except Exception:  # pragma: no cover
             pass
-        return event
+        return event if bound else event
 
     async def inline_form(
         self,
@@ -1063,26 +1658,384 @@ class McubKernelInterface:
     async def conversation(self, chat_id: int, *args: Any, **kw: Any) -> ConversationShim:
         return ConversationShim(self.h.transport, int(chat_id))
 
-    async def handle_error(self, exc: Exception, *args: Any, **kw: Any) -> None:
-        message = kw.get("message") or kw.get("source") or "Module error"
-        event = kw.get("event")
+    async def handle_error(
+        self,
+        exc: Exception,
+        source: str = "unknown",
+        message: Optional[str] = None,
+        event: Any = None,
+        **_legacy: Any,
+    ) -> None:
+        label = message or (source if source != "unknown" else "Module error")
+        if event is None and isinstance(source, Exception):  # pragma: no cover
+            event = source  # старый позиционный вызов handle_error(e, event)
         self.logger.error(
             "%s: %s",
-            message,
+            label,
             exc,
             exc_info=(type(exc), exc, exc.__traceback__),
         )
+        with suppress(Exception):
+            await self.send_error_log(str(exc), source, label)
         if event is not None and hasattr(event, "reply"):
             try:
                 await event.reply(f"<b>Error:</b> <code>{str(exc)[:200]}</code>")
             except Exception:  # noqa: BLE001
                 pass
 
+    # ------------------------------------------------------------------
+    # kernel.md MCUB-fork: переменные ядра
+    # ------------------------------------------------------------------
+
+    @property
+    def ADMIN_ID(self) -> Any:
+        """ID владельца юзербота (как kernel.ADMIN_ID в MCUB-fork)."""
+
+        return self.h.owner_id
+
+    @property
+    def owner_id(self) -> Any:
+        return self.h.owner_id
+
+    @property
+    def bot_command_handlers(self) -> dict:
+        return {
+            name: (name, handler)
+            for name, handler in getattr(self.h, "bot_commands", {}).items()
+        }
+
+    @property
+    def bot_command_owners(self) -> dict:
+        return dict(getattr(self, "_bot_command_owners", {}))
+
+    @property
+    def inline_handlers_owners(self) -> dict:
+        return dict(self._inline_owners)
+
+    @property
+    def inline(self) -> _InlineNS:
+        return self._inline
+
+    @property
+    def repositories(self) -> list:
+        if self._repositories is None:
+            self._repositories = self._json_file("module_repos.json", [self.default_repo])
+        return self._repositories
+
+    @repositories.setter
+    def repositories(self, value: list) -> None:
+        self._repositories = list(value or [])
+
+    @property
+    def _module_sources(self) -> dict:
+        """Источники установленных URL-модулей (kernel._module_sources MCUB-fork)."""
+
+        if self._module_sources_store is None:
+            self._module_sources_store = self._json_file("module_sources.json", {})
+        return self._module_sources_store
+
+    @_module_sources.setter
+    def _module_sources(self, value: Any) -> None:
+        self._module_sources_store = value
+
+    @property
+    def error_load_modules(self) -> list:
+        return getattr(self, "_error_load_modules", [])
+
+    # ------------------------------------------------------------------
+    # kernel.md MCUB-fork: утилиты
+    # ------------------------------------------------------------------
+
+    def get_prefix_for_sender(self, sender_id: Any) -> str:
+        owner_prefixes = getattr(self, "owner_prefixes", {}) or {}
+        sender_key = str(sender_id) if sender_id is not None else ""
+        admin_key = str(getattr(self, "ADMIN_ID", "") or "")
+        if sender_key and sender_key in owner_prefixes:
+            return owner_prefixes[sender_key]
+        if admin_key and admin_key in owner_prefixes:
+            return owner_prefixes[admin_key]
+        return getattr(self, "custom_prefix", ".") or "."
+
+    def raw_text(self, source: Any) -> str:
+        """HTML-текст сообщения (telethon html.unparse), офлайн — эскейп str."""
+
+        if source is None:
+            return ""
+        if not isinstance(source, str):
+            text = getattr(source, "message", None) or getattr(source, "text", None) or ""
+            entities = getattr(source, "entities", None) or []
+        else:
+            text, entities = source, []
+        try:
+            from telethon.extensions import html as telethon_html  # type: ignore
+
+            return telethon_html.unparse(text, entities)
+        except Exception:  # noqa: BLE001 - офлайн-шим/старый telethon
+            import html as _html
+
+            return _html.escape(str(text))
+
+    async def process_command(self, event: Any, depth: int = 0) -> bool:
+        """Вызвать зарегистрированную команду как если бы её набрал юзер."""
+
+        text = getattr(event, "text", "") or ""
+        prefix = self.custom_prefix or "."
+        if not text.startswith(prefix) or depth > 5:
+            return False
+        name = text[len(prefix):].split(maxsplit=1)[0]
+        name = self.h.aliases.get(name, name)
+        handler = self.h.command_handlers.get(name)
+        if handler is None:
+            return False
+        self._prepare_callback_event(event)
+        result = handler(event)
+        if inspect.isawaitable(result):
+            await result
+        return True
+
+    async def shutdown(self) -> None:
+        """kernel.shutdown(): поднять флаг и остановить транспорт."""
+
+        self.shutdown_flag = True
+        stop = getattr(self.h.transport, "stop", None)
+        if callable(stop):
+            result = stop()
+            if inspect.isawaitable(result):
+                await result
+
+    # ------------------------------------------------------------------
+    # Лог-чат (kernel._log / kernel.send_log_message в MCUB-fork)
+    # ------------------------------------------------------------------
+
+    async def send_log_message(self, text: str, file: Any = None) -> bool:
+        """Отправить сообщение в лог-чат (или «Избранное», если чат не задан)."""
+
+        if getattr(self.client, "is_offline", False):
+            self.logger.info("log(offline): %s", text)
+            return False
+        chat_id = self.log_chat_id or self.config.get("log_chat_id")
+        target = chat_id if chat_id else getattr(self.h.transport, "me_id", None)
+        if target is None:
+            return False
+        try:
+            if file is not None and hasattr(self.client, "send_file"):
+                await self.client.send_file(target, file, caption=str(text))
+            else:
+                await self.h.transport.send(int(target), str(text))
+            return True
+        except Exception:  # noqa: BLE001 - лог-чат не должен ронять модули
+            self.logger.debug("send_log_message failed", exc_info=True)
+            return False
+
+    async def send_error_log(self, error_text: str, source_file: str, message_info: str = "") -> None:
+        header = f"🔴 <b>{source_file}</b>"
+        if message_info:
+            header += f": {message_info}"
+        await self.send_log_message(f"{header}\n<code>{error_text[:1500]}</code>")
+        self._log.save_error_to_file(f"{source_file}: {error_text}")
+
+    async def log_module(self, message: str) -> None:
+        await self._log.log_module(message)
+
+    async def log_network(self, message: str) -> None:
+        await self._log.log_network(message)
+
+    async def log_error_async(self, message: str) -> None:
+        await self._log.log_error_async(message)
+
+    # ------------------------------------------------------------------
+    # Репозитории модулей (installation.py / loader.py MCUB-fork)
+    # ------------------------------------------------------------------
+
+    def _json_file(self, name: str, default: Any) -> Any:
+        path = Path("data") / name
+        try:
+            if path.is_file():
+                import json as _json
+
+                return _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+        return default
+
+    def _save_json_file(self, name: str, value: Any) -> None:
+        path = Path("data") / name
+        try:
+            import json as _json
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:  # pragma: no cover
+            self.logger.debug("cannot persist %s", name, exc_info=True)
+
+    def get_repo_name(self, url: str = "") -> str:
+        url = (url or self.default_repo).rstrip("/")
+        tail = url.split("github.com/")[-1] if "github.com/" in url else url
+        return tail.split("/raw/")[0].strip("/") or "repository"
+
+    def add_repository(self, url: str) -> bool:
+        url = str(url).strip().rstrip("/") + "/"
+        if url not in self.repositories:
+            self.repositories.append(url)
+            self._save_json_file("module_repos.json", self.repositories)
+            return True
+        return False
+
+    def remove_repository(self, url: str) -> bool:
+        url = str(url).strip().rstrip("/") + "/"
+        if url in self.repositories:
+            self.repositories.remove(url)
+            self._save_json_file("module_repos.json", self.repositories)
+            return True
+        return False
+
+    def _fetch_url(self, url: str, timeout: int = 20) -> str:
+        from urllib.request import Request, urlopen
+
+        req = Request(url, headers={"User-Agent": "hydra-mcub-compat"})
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - пользовательский URL по команде владельца
+            return resp.read().decode("utf-8", errors="replace")
+
+    async def get_repo_modules_list(self, repo_url: Optional[str] = None) -> list:
+        """Список имён модулей репозитория (files.list / modules.txt / index)."""
+
+        base = (repo_url or self.default_repo).rstrip("/") + "/"
+        for candidate in ("files.list", "modules.txt"):
+            try:
+                text = await asyncio.to_thread(self._fetch_url, base + candidate)
+                names = [
+                    line.strip()[:-3]
+                    for line in text.splitlines()
+                    if line.strip().endswith(".py")
+                ]
+                if names:
+                    return names
+            except Exception:  # noqa: BLE001
+                continue
+        return []
+
+    async def download_module_from_repo(self, module_name: str, repo_url: Optional[str] = None) -> Optional[str]:
+        base = (repo_url or self.default_repo).rstrip("/") + "/"
+        slug = str(module_name).strip().removesuffix(".py")
+        try:
+            return await asyncio.to_thread(self._fetch_url, f"{base}{slug}.py")
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ------------------------------------------------------------------
+    # Источники установленных модулей (loader.py MCUB-fork)
+    # ------------------------------------------------------------------
+
+    async def save_module_sources(self) -> None:
+        self._save_json_file("module_sources.json", self._module_sources)
+
+    async def delete_module_config(self, module: str) -> None:
+        self._live_module_configs.pop(module, None)
+        path = Path("data/module_configs.json")
+        try:
+            import json as _json
+
+            data = {}
+            if path.is_file():
+                data = _json.loads(path.read_text(encoding="utf-8"))
+            if data.pop(module, None) is not None:
+                path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def unregister_module_commands(self, module_name: str) -> int:
+        """Снять все команды, зарегистрированные указанным модулем."""
+
+        removed = 0
+        owner_key = str(module_name)
+        dropped_cmds: set = set()
+        for cmd, owner in list(self.command_owners.items()):
+            if owner != owner_key:
+                continue
+            self.command_owners.pop(cmd, None)
+            self.h.command_handlers.pop(cmd, None)
+            dropped_cmds.add(cmd)
+            removed += 1
+        for alias, target in list(self.h.aliases.items()):
+            if target in dropped_cmds or target == module_name:
+                self.h.aliases.pop(alias, None)
+        return removed
+
+    # ------------------------------------------------------------------
+    # Загрузка из файла / зависимости (loader.py MCUB-fork)
+    # ------------------------------------------------------------------
+
+    async def load_module_from_file(self, file_path: Any, module_name: Optional[str] = None) -> Tuple[bool, str]:
+        """Загрузить .py через безопасный пайплайн L3 (scanner + mcub-адаптер)."""
+
+        path = Path(str(file_path))
+        if not path.is_file():
+            return False, f"файл не найден: {path}"
+        name = re.sub(r"[^\w\-.]", "_", module_name or path.stem)
+        try:
+            source = path.read_text(encoding="utf-8")
+            record = await self.h.loader.load_source(
+                name,
+                source,
+                framework="mcub",
+                allow_unsafe=False,
+                file_path=str(path),
+            )
+            return True, f"загружен: {getattr(record, 'name', name)}"
+        except Exception as exc:  # noqa: BLE001 - MCUB-совместимый ответ, а не исключение
+            return False, str(exc)[:300]
+
+    async def install_dependencies_batch(self, deps: Any) -> Tuple[bool, str]:
+        """Пакетная установка pip-зависимостей (по loader.py MCUB-fork)."""
+
+        if isinstance(deps, str):
+            deps = [deps]
+        specs = [str(dep).strip() for dep in (deps or []) if str(dep).strip()]
+        if not specs:
+            return True, "нет зависимостей"
+        import sys as _sys
+
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, "-m", "pip", "install", "--quiet", *specs,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        ok = proc.returncode == 0
+        tail = (out or b"").decode("utf-8", errors="replace")[-400:]
+        return ok, ("установлено" if ok else f"pip error: {tail}")
+
+    # -- диагностические no-op'ы диспетчера (единый движок их покрывает сам) --
+
+    def dedupe_event_builders(self, *args: Any, **kw: Any) -> bool:
+        return True
+
+    def ensure_core_message_handlers(self, *args: Any, **kw: Any) -> bool:
+        return True
+
+    def ensure_registered_module_handlers(self, *args: Any, **kw: Any) -> bool:
+        return True
+
+    def _debug_event_builders_snapshot(self, *args: Any, **kw: Any) -> dict:
+        return {"duplicates": 0, "builders": 0}
+
     async def get_thread_id(self, event: Any) -> Optional[int]:
-        return getattr(event, "reply_to_msg_id", None)
+        reply_to = getattr(event, "reply_to_msg_id", None)
+        if reply_to is not None:
+            return reply_to
+        raw = getattr(event, "raw", None)
+        return getattr(raw, "reply_to_top_id", None)
 
     async def get_user_info(self, user_id: int) -> str:
-        return f"user#{user_id}"
+        try:
+            entity = await self.client.get_entity(user_id)
+            username = getattr(entity, "username", None)
+            if username:
+                return f"@{username} ({user_id})"
+            name = getattr(entity, "first_name", None) or ""
+            return f"{name} ({user_id})".strip()
+        except Exception:  # noqa: BLE001
+            return f"user#{user_id}"
 
     def cprint(self, *args: Any, **kw: Any) -> None:
         print(*args, **kw)
@@ -1220,6 +2173,12 @@ class McubAdapter(CompatAdapter):
                 res = ns["register"](iface)
                 if inspect.isawaitable(res):
                     await res
+                # @kernel.register.method setup-функции (semantics MCUB-fork:
+                # вызываются при загрузке с kernel-аргументом).
+                for fn in iface._pending_methods.pop(name, []):
+                    result = iface.register._call_loop(fn)  # kernel-arg или без
+                    if inspect.isawaitable(result):
+                        await result
                 return iface, scope
 
             # class-style: shim-ModuleBase ИЛИ подкласс настоящего core ModuleBase

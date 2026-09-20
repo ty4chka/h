@@ -223,10 +223,17 @@ class CoreStyleAdapter:
             if not cmd:
                 continue
 
-            async def wrapper(msg: Any, _fn=fn) -> None:
+            async def wrapper(msg: Any, _fn=fn, _cmd=cmd) -> None:
                 # владелец юзера — хозяин команд; чужие входящие не трогаем,
                 # если модуль не подписан на incoming сам по себе
                 await _fn(msg)
+
+            # Явная привязка команды к исходнику: man/iface.get_module_commands
+            # ищут владельца по __owner_module__/__bound_module_name__ (см.
+            # hydra_kernel/compat/mcub.py:_McubLoaderView._names_for). Без этого
+            # core-style модули показывались как «no commands».
+            wrapper.__owner_module__ = name  # type: ignore[attr-defined]
+            wrapper.__bound_module_name__ = name  # type: ignore[attr-defined]
 
             unsub = self.h.transport.subscribe(
                 wrapper,

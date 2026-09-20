@@ -87,6 +87,14 @@ class ButtonBridge:
                 if not isinstance(btn, dict) or btn.get("data") is None:
                     if isinstance(btn, dict) and btn.get("url"):
                         items.append(f"↗ {html.escape(str(btn.get('text', '?')))}: {btn['url']}")
+                    elif isinstance(btn, dict) and "query" in btn:
+                        # switch-inline кнопка: у юзербота нет инлайн-бота,
+                        # поэтому мапим запрос на локальный .iq-поиск.
+                        query = str(btn.get("query") or "")
+                        label = html.escape(str(btn.get("text", "?")))
+                        items.append(
+                            f"🔎 {label}: <code>{prefix}iq {html.escape(query)}</code>"
+                        )
                     continue
                 label = html.escape(str(btn.get("text", "?")))
                 if btn.get("input"):

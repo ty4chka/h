@@ -109,6 +109,11 @@ class Lifecycle:
                     except Exception:  # pragma: no cover
                         pass
 
+            # MCUB-совместимый man узнаёт владельца команды по привязке
+            # (как у MCUB-модулей, иначе нативные выглядят «no commands»).
+            wrapper.__original__ = fn  # type: ignore[attr-defined]
+            wrapper.__bound_instance__ = module  # type: ignore[attr-defined]
+
             self._unsubs.append(
                 module.ctx.transport.subscribe(wrapper, pattern=pattern, outgoing=True, incoming=True)
             )

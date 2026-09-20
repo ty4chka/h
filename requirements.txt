@@ -1,6 +1,8 @@
 # === ЯДРО ===
 telethon>=1.35.0
 rich>=13.0.0
+# YAML — языковые паки/архивы модулей MCUB (translations и др.)
+PyYAML>=6.0.0
 
 # === CYTHON ===
 cython>=3.0.0

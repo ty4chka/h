@@ -101,8 +101,52 @@ MCUB_MODS_DIR = Path("modules/mcub_mods")
 # MCUB MODULES HELPERS
 # ============================================
 
+def _get_mcub_iface():
+    """MCUB-интерфейс единого движка (modules.mcub -> hydra_kernel.compat.mcub).
+
+    Новый основной маршрут: все MCUB-модули живут в едином реестре Hydra,
+    так что install/unload/list проходят через adapter_for("mcub").iface.
+    Возвращает iface или None, если единый движок недоступен.
+    """
+    try:
+        from modules.mcub import get_hydra
+
+        h = get_hydra()
+        if h is None or getattr(h, "loader", None) is None:
+            return None
+        adapter = h.loader.adapter_for("mcub")
+        return getattr(adapter, "iface", None)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"single-engine MCUB iface error: {e}")
+        return None
+
+
 def get_mcub_modules():
-    """Get list of loaded MCUB modules"""
+    """Get list of loaded MCUB modules: (name, mtype, ncmds, meta)-кортежи."""
+
+    # 1) Единый движок.
+    iface = _get_mcub_iface()
+    if iface is not None:
+        try:
+            out = []
+            for name, instance in iface.loaded_modules.items():
+                names = iface._loader._names_for(str(name))
+                ncmds = sum(
+                    1 for cmd, owner in iface.command_owners.items() if str(owner) in names
+                )
+                meta = {
+                    "version": getattr(instance, "version", None)
+                    or getattr(instance, "__version__", None),
+                    "author": getattr(instance, "author", None)
+                    or getattr(instance, "__author__", None),
+                }
+                mtype = "mcub" if str(name).endswith("_mcub_repo") or hasattr(instance, "register") else "core"
+                out.append((str(name), mtype, ncmds, meta))
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"single-engine MCUB list error: {e}")
+
+    # 3) Легаси mcub_engine (fallback).
     if not MCUB_AVAILABLE:
         return []
     try:
@@ -120,6 +164,30 @@ def is_mcub_module(name):
 
 async def unload_mcub_module(name):
     """Unload MCUB module by name"""
+    # 1) Единый движок.
+    try:
+        from modules.mcub import get_hydra
+
+        h = get_hydra()
+        if h is not None:
+            iface = _get_mcub_iface()
+            if iface is not None:
+                names = iface._loader._names_for(str(name))
+                for candidate in names:
+                    if candidate in h.registry._records or candidate in iface.loaded_modules:
+                        ok = await h.loader.unload(candidate)
+                        if ok:
+                            return True, f"Module {candidate} unloaded (single engine)"
+            else:
+                # без iface — пробуем напрямую по имени
+                if name in h.registry._records:
+                    ok = await h.loader.unload(name)
+                    if ok:
+                        return True, f"Module {name} unloaded (single engine)"
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"single-engine MCUB unload error: {e}")
+
+    # 3) Легаси mcub_engine (fallback).
     if not MCUB_AVAILABLE:
         return False, "MCUB Engine not available"
     try:
@@ -133,6 +201,16 @@ async def unload_mcub_module(name):
 
 async def load_mcub_module_file(file_path):
     """Load MCUB module from file"""
+    # 1) Единый движок.
+    iface = _get_mcub_iface()
+    if iface is not None:
+        try:
+            ok, msg = await iface.load_module_from_file(file_path)
+            return ok, msg
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"single-engine MCUB load error: {e}")
+
+    # 3) Легаси mcub_engine (fallback).
     if not MCUB_AVAILABLE:
         return False, "MCUB Engine not available"
     try:

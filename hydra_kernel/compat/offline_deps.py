@@ -160,6 +160,30 @@ def _install_telethon() -> None:
         def switch_inline(text: str, query: str = "", **kwargs: Any) -> _Button:
             return _Button(text, None, query=query, **kwargs)
 
+        @staticmethod
+        def inline(text: str, data: Any = None, **kwargs: Any) -> _Button:
+            return _Button(text, data if data is not None else text.encode(), **kwargs)
+
+        @staticmethod
+        def copy(text: str, copy_text: str = None, **kwargs: Any) -> _Button:
+            return _Button(text, None, copy=copy_text or text, **kwargs)
+
+        @staticmethod
+        def request_phone(text: str, **kwargs: Any) -> _Button:
+            return _Button(text, None, request_phone=True, **kwargs)
+
+        @staticmethod
+        def request_location(text: str, **kwargs: Any) -> _Button:
+            return _Button(text, None, request_location=True, **kwargs)
+
+        @staticmethod
+        def request_poll(text: str, **kwargs: Any) -> _Button:
+            return _Button(text, None, request_poll=True, **kwargs)
+
+        @staticmethod
+        def game(text: str, **kwargs: Any) -> _Button:
+            return _Button(text, None, game=True, **kwargs)
+
     class _EventBuilder:
         Event = object
 
@@ -209,6 +233,10 @@ def _install_telethon() -> None:
         child = _put_module(f"telethon.tl.functions.{part}")
         _dynamic_types(child, base=TLRequest)
         setattr(functions_mod, part, child)
+
+    custom_mod = _put_module("telethon.tl.custom")
+    _dynamic_types(custom_mod)
+    tl.custom = custom_mod
 
     # Некоторые модули используют короткий путь `telethon.types`.
     sys.modules["telethon.types"] = types_mod
