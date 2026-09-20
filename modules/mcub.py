@@ -8,8 +8,10 @@ m.py вызывает setup(client); дальше await wait_ready() даёт з
 """
 
 import asyncio
+import hashlib
 import logging
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,48 @@ _HYDRA = None
 _BOOT_TASK = None
 _RESULT = None
 BOOT_TIME = 0.0  # секунды на загрузку модулей (для строки boot: X.XXs)
+MODULES_DIR = Path(__file__).resolve().parent
+
+
+async def _load_owned_modules(hydra):
+    """Загрузить родные модули и сохранённые пользователем MCUB-модули.
+
+    ``Loader.load_dir`` намеренно не обходит каталоги рекурсивно. Поэтому
+    modules/mcub_mods раньше отображался в TUI, но не попадал в единый runtime.
+    Загружаем его отдельной волной тем же MCUB adapter'ом.
+    """
+
+    records, errors = await hydra.loader.load_dir(
+        MODULES_DIR,
+        framework="auto",
+        exclude=("mcub", "__init__"),
+        allow_unsafe=True,
+    )
+    mcub_dir = MODULES_DIR / "mcub_mods"
+    if mcub_dir.is_dir():
+        # Репозитории модулей нередко оставляют рядом старое имя файла. Не
+        # запускаем байт-в-байт копию второй раз: она зарегистрирует одинаковые
+        # команды и может отправить два ответа на одно сообщение.
+        seen_sources = {}
+        duplicate_stems = []
+        for source in sorted(mcub_dir.glob("*.py")):
+            if source.stem == "__init__":
+                continue
+            digest = hashlib.sha256(source.read_bytes()).digest()
+            original = seen_sources.setdefault(digest, source)
+            if original is not source:
+                duplicate_stems.append(source.stem)
+                logger.debug("skipping duplicate MCUB module %s (same as %s)", source.name, original.name)
+
+        mcub_records, mcub_errors = await hydra.loader.load_dir(
+            mcub_dir,
+            framework="mcub",
+            exclude=("__init__", *duplicate_stems),
+            allow_unsafe=True,
+        )
+        records.extend(mcub_records)
+        errors.extend(mcub_errors)
+    return records, errors
 
 
 async def reload_all():
@@ -28,13 +72,10 @@ async def reload_all():
     for name in list(getattr(hydra.registry, "_records", {}).keys()):
         try:
             await hydra.loader.unload(name)
-        except Exception as e:  # noqa: BLE001
-            logger.error("unload %s: %s", name, e)
+        except Exception:  # noqa: BLE001
+            logger.exception("unload %s failed", name)
     t0 = time.monotonic()
-    records, errors = await hydra.loader.load_dir(
-        "modules", framework="auto", exclude=("mcub", "__init__"),
-        allow_unsafe=True,
-    )
+    records, errors = await _load_owned_modules(hydra)
     global BOOT_TIME
     BOOT_TIME = time.monotonic() - t0
     _RESULT = (records, errors)
@@ -66,16 +107,32 @@ async def _boot(client) -> None:
         # terminal и т.п. — легально); сканер остаётся строгим для .mload
         global BOOT_TIME
         t0 = time.monotonic()
-        records, errors = await hydra.loader.load_dir(
-            "modules", framework="auto", exclude=("mcub", "__init__"),
-            allow_unsafe=True,
-        )
+        records, errors = await _load_owned_modules(hydra)
         BOOT_TIME = time.monotonic() - t0
         for name, err in errors:
-            logger.error("engine: модуль %s не встал: %s", name, err)
+            logger.error(
+                "engine: module %s failed to load: %s",
+                name,
+                err,
+                exc_info=(type(err), err, getattr(err, "__traceback__", None)),
+            )
         _HYDRA = hydra
         _RESULT = (records, errors)
-        logger.info("single engine online: %d модулей", len(records))
+        diagnostics = getattr(hydra.transport, "diagnostics", None)
+        try:
+            metrics = diagnostics() if callable(diagnostics) else {}
+        except Exception:  # noqa: BLE001 - metrics must never block boot
+            metrics = {}
+        if metrics:
+            logger.info(
+                "single engine online: %d modules | logical=%s | shared NewMessage=%s | client NewMessage=%s",
+                len(records),
+                metrics.get("subscriptions", "?"),
+                metrics.get("native_message_handlers", "?"),
+                metrics.get("client_new_message_handlers", "?"),
+            )
+        else:
+            logger.info("single engine online: %d modules", len(records))
     except Exception as e:  # noqa: BLE001 — не роняем бота из-за ядра
         logger.error("engine boot error: %s", e, exc_info=True)
         _RESULT = ([], [(type(e).__name__, e)])

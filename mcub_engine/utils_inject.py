@@ -14,6 +14,7 @@ from __future__ import annotations
 import html as _html
 import logging
 import re
+import shlex
 import sys
 import types
 from typing import Any
@@ -203,10 +204,17 @@ async def get_admins(client, chat):
 # ---------- arg_parser ----------
 
 class ArgumentParser:
-    """Упрощённый порт utils.arg_parser.ArgumentParser из MCUB."""
+    """Small stateful port of MCUB's command argument parser.
 
-    def __init__(self, tokens=None):
-        self._tokens = tokens or []
+    In addition to sequential tokens, current MCUB modules rely on the raw
+    command tail and ``--key=value`` lookups.  Keep both representations: flag
+    helpers may consume parsed tokens without corrupting the user prompt held
+    in :attr:`raw_args`.
+    """
+
+    def __init__(self, tokens=None, raw_args: str | None = None):
+        self._tokens = list(tokens or [])
+        self.raw_args = str(raw_args if raw_args is not None else " ".join(self._tokens))
         self._pos = 0
 
     def __iter__(self):
@@ -265,6 +273,38 @@ class ArgumentParser:
                 return True
         return default
 
+    def get_kwarg(self, name: str, default=None):
+        """Return and consume ``--name=value`` or ``--name value``.
+
+        MCUB modules commonly use this for opt-in internal modes while still
+        treating everything else as a free-form prompt.  Supporting both long
+        and single-dash spellings mirrors :meth:`get_flag` and avoids leaking
+        the option itself into a subsequent token consumer.
+        """
+
+        needles = (f"--{name}", f"-{name}")
+        for i, token in enumerate(self._tokens):
+            for needle in needles:
+                prefix = f"{needle}="
+                if token.startswith(prefix):
+                    value = token[len(prefix):]
+                    del self._tokens[i]
+                    if i < self._pos:
+                        self._pos -= 1
+                    return value
+                if token == needle:
+                    if i + 1 >= len(self._tokens):
+                        del self._tokens[i]
+                        if i < self._pos:
+                            self._pos -= 1
+                        return default
+                    value = self._tokens[i + 1]
+                    del self._tokens[i:i + 2]
+                    if i < self._pos:
+                        self._pos = max(0, self._pos - 2)
+                    return value
+        return default
+
     def has_flag(self, name: str) -> bool:
         """Проверяет наличие флага без удаления его из токенов."""
         needle_long = f"--{name}"
@@ -276,13 +316,19 @@ class ArgumentParser:
 
 
 def parse_arguments(text, prefix=".") -> ArgumentParser:
-    text = text or ""
+    """Parse a command tail while retaining its exact, user-visible text."""
+
+    text = str(text or "")
+    raw_args = text
     if prefix and text.startswith(prefix):
-        parts = text.split()
-        tokens = parts[1:] if parts else []
-    else:
-        tokens = text.split()
-    return ArgumentParser(tokens)
+        parts = text.split(maxsplit=1)
+        raw_args = parts[1] if len(parts) > 1 else ""
+    try:
+        tokens = shlex.split(raw_args)
+    except ValueError:
+        # An unfinished quote should not make a command silently disappear.
+        tokens = raw_args.split()
+    return ArgumentParser(tokens, raw_args=raw_args)
 
 
 # ---------- placeholders bridge ----------

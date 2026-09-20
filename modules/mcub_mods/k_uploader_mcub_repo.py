@@ -5,7 +5,11 @@ import io
 from collections.abc import Callable
 from typing import Any
 
-import requests
+try:
+    import requests
+except ImportError:  # optional until a network upload command is used
+    requests = None
+
 from telethon import events
 
 from core.lib.loader.module_base import ModuleBase, command
@@ -100,6 +104,8 @@ class UploaderModules(ModuleBase):
         return f"file_{getattr(reply, 'id', 'unknown')}.jpg"
 
     async def _request(self, request_func: Callable[..., requests.Response], *args: Any, **kwargs: Any) -> requests.Response:
+        if requests is None:
+            raise RuntimeError("requests is required for upload commands; install it with: pip install requests")
         return await asyncio.to_thread(request_func, *args, **kwargs)
 
     async def _upload(
@@ -108,6 +114,15 @@ class UploaderModules(ModuleBase):
         source: str,
         uploader: Callable[[io.BytesIO], Any],
     ) -> None:
+        if requests is None:
+            await self.edit(
+                event,
+                self.strings(
+                    "error",
+                    error="requests is not installed; run: pip install requests",
+                ),
+            )
+            return
         await self.edit(event, self.strings["uploading"])
         file = await self._get_file(event)
         if not file:

@@ -10,6 +10,7 @@ import asyncio
 import os
 import re
 import time
+from pathlib import Path
 from datetime import datetime
 import pty
 import select
@@ -23,8 +24,25 @@ import signal
 # КОНФИГУРАЦИЯ
 # ============================================
 
-# Путь к chroot (Arch Linux) — меняй здесь если нужно
-CHROOT_PATH = "/home/Oblochko/termux/arch"
+def _resolve_chroot_path() -> str:
+    """Pick a real local Arch root instead of another user's hard-coded path."""
+
+    configured = os.environ.get("HYDRA_CHROOT_PATH", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        Path.home() / "arch",
+        Path.home() / "termux" / "arch",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_dir():
+            return str(candidate)
+    # Keep an explicit, user-local default in diagnostics; users can set
+    # HYDRA_CHROOT_PATH before launch when their proot lives elsewhere.
+    return str(Path(configured).expanduser()) if configured else str(Path.home() / "arch")
+
+
+# Путь к chroot (Arch Linux). Override with HYDRA_CHROOT_PATH when needed.
+CHROOT_PATH = _resolve_chroot_path()
 
 # Путь к startarch скрипту
 STARTARCH_PATH = os.path.join(CHROOT_PATH, "startarch")
@@ -120,6 +138,13 @@ async def execute_in_chroot(cmd, timeout=30, rows=24, cols=80, cwd="/root"):
     master = slave = None
     proc = None
     output_chunks = []  # Инициализируем ЗДЕСЬ, до try
+
+    if not os.path.isdir(CHROOT_PATH):
+        return (
+            "Arch chroot не найден: " + CHROOT_PATH
+            + "\nУкажите существующий путь через HYDRA_CHROOT_PATH и перезапустите Hydra.",
+            127,
+        )
 
     # Проверяем наличие startarch
     if os.path.exists(STARTARCH_PATH):

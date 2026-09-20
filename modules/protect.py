@@ -848,11 +848,15 @@ def register(kernel):
         cfg["mcub_mode"] = "custom"
         protection_enabled = True
         _apply_mcub_mode("custom")
-        try:
-            client.clear_blocked_request_handler()
-        except Exception:
-            pass
-        client.on_blocked_request(_mcub_violation_handler)
+        # The extra protection hook exists only in the patched MCUB Telethon
+        # client.  Hydra may run on stock Telethon, where the normal local
+        # protection controls remain usable but this hook is unavailable.
+        if _mcub_available:
+            try:
+                client.clear_blocked_request_handler()
+            except Exception:
+                pass
+            client.on_blocked_request(_mcub_violation_handler)
         persist_api_config()
         ok_emoji = '<tg-emoji emoji-id="5368585403467048206">🪬</tg-emoji>'
         text = f"{ok_emoji} {'Lockdown enabled' if new_val else 'Lockdown disabled'}"
@@ -915,11 +919,12 @@ def register(kernel):
                 api_config["mcub_mode"] = mode
             protection_enabled = api_config["enable_protection"] = True
             _apply_mcub_mode(mode)
-            try:
-                client.clear_blocked_request_handler()
-            except Exception:
-                pass
-            client.on_blocked_request(_mcub_violation_handler)
+            if _mcub_available:
+                try:
+                    client.clear_blocked_request_handler()
+                except Exception:
+                    pass
+                client.on_blocked_request(_mcub_violation_handler)
             persist_api_config()
             label = (f'<tg-emoji emoji-id="5368585403467048206">🪬</tg-emoji> {on_label} . '
                      f'{mode_set_tpl.format(mode=mode, dry="")}')

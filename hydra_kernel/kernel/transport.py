@@ -10,11 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 Handler = Callable[["Message"], Awaitable[None]]
+logger = logging.getLogger("hydra_kernel.transport")
+
+
+def _milliseconds_from_env(name: str, default: float) -> float:
+    """Read a positive timing threshold without letting a bad env break boot."""
+
+    try:
+        return max(1.0, float(os.environ.get(name, default))) / 1000.0
+    except (TypeError, ValueError):
+        return default / 1000.0
 
 
 @dataclass
@@ -54,13 +67,184 @@ class Message:
         return self.text
 
     @property
+    def peer_id(self) -> int:
+        """Telethon-совместимый идентификатор диалога."""
+        return self.chat_id
+
+    @property
+    def id(self) -> int:
+        """Telethon-совместимый алиас ``Message.id``."""
+        return self.message_id
+
+    @property
+    def reply_to_msg_id(self) -> Any:
+        """ID сообщения, на которое отвечает команда, если оно есть.
+
+        L2-адаптер передаёт модулям нормализованный ``Message``, тогда как
+        исходные MCUB-модули ожидают поле Telethon ``reply_to_msg_id``. У
+        ``NewMessage.Event`` оно может жить как на самом событии, так и на
+        вложенном ``event.message`` — поддерживаем оба варианта.
+        """
+
+        raw_message = getattr(self.raw, "message", None)
+        for source in (self.raw, raw_message):
+            if source is None:
+                continue
+            value = getattr(source, "reply_to_msg_id", None)
+            if value is not None:
+                return value
+            reply_to = getattr(source, "reply_to", None)
+            value = getattr(reply_to, "reply_to_msg_id", None)
+            if value is not None:
+                return value
+        return None
+
+    @property
+    def entities(self) -> list[Any]:
+        """NullTransport не парсит разметку, но Hikka ждёт iterable."""
+        return []
+
+    def _raw_sources(self) -> tuple[Any, ...]:
+        """Return both shapes used by Telethon events without exposing them.
+
+        ``events.NewMessage.Event`` keeps most chat metadata on the event, but
+        a few Telethon versions expose it on ``event.message`` instead.  Hydra
+        hands modules a normalized :class:`Message`, so all compatibility
+        aliases must check both locations.
+        """
+
+        raw_message = getattr(self.raw, "message", None)
+        return tuple(source for source in (self.raw, raw_message) if source is not None)
+
+    def _raw_flag(self, name: str) -> Optional[bool]:
+        """Read a boolean Telethon chat flag, if the raw event has one."""
+
+        for source in self._raw_sources():
+            try:
+                value = getattr(source, name, None)
+            except Exception:  # pragma: no cover - foreign event descriptors
+                continue
+            if value is not None:
+                return bool(value)
+        return None
+
+    async def get_reply_message(self) -> Any:
+        """Вернуть исходный reply в live Telethon или ``None`` офлайн."""
+
+        for source in self._raw_sources():
+            getter = getattr(source, "get_reply_message", None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return None
+
+    @property
+    def client(self) -> Any:
+        """Telethon-compatible ``event.client``.
+
+        Native/core-style modules receive the same normalized event as MCUB
+        modules.  They nevertheless legitimately use ``event.client`` for
+        operations such as ``send_file``.  In production prefer the exact
+        client attached to the raw Telethon event; the transport client is the
+        deterministic offline fallback used by setup-style modules as well.
+        """
+
+        for source in self._raw_sources():
+            try:
+                client = getattr(source, "client", None)
+            except Exception:  # pragma: no cover - foreign event descriptors
+                continue
+            if client is not None:
+                return client
+        return getattr(self.transport, "client", None) if self.transport is not None else None
+
+    @property
+    def is_group(self) -> bool:
+        """Whether this event belongs to a basic group or a megagroup."""
+
+        flag = self._raw_flag("is_group")
+        if flag is not None:
+            return flag
+        # Telethon's normalized IDs are negative for group/channel peers.  A
+        # raw event always wins above; this fallback makes offline smoke events
+        # useful without pretending that an ordinary private chat is a group.
+        return self.chat_id < 0
+
+    @property
+    def is_private(self) -> bool:
+        """Telethon-compatible private-chat predicate."""
+
+        flag = self._raw_flag("is_private")
+        if flag is not None:
+            return flag
+        return self.chat_id > 0
+
+    @property
+    def is_channel(self) -> bool:
+        """Telethon-compatible channel predicate when available."""
+
+        flag = self._raw_flag("is_channel")
+        if flag is not None:
+            return flag
+        # ``-100…`` is Telegram's marked channel/supergroup ID range.  This is
+        # only an offline approximation; raw Telethon metadata takes priority.
+        return self.chat_id <= -100_000_000_000
+
+    @property
     def sender(self) -> Any:
         """telethon-совместимость: event.sender (если raw-событие даёт его)."""
-        return getattr(self.raw, "sender", None)
+        raw_message = getattr(self.raw, "message", None)
+        return getattr(self.raw, "sender", None) or getattr(raw_message, "sender", None)
+
+    @property
+    def mentioned(self) -> bool:
+        """Whether Telegram marked this message as mentioning the account."""
+
+        flag = self._raw_flag("mentioned")
+        return bool(flag)
+
+    async def _raw_getter(self, name: str) -> Any:
+        """Call a Telethon getter on the raw event/message when available."""
+
+        for source in self._raw_sources():
+            getter = getattr(source, name, None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return None
+
+    async def get_chat(self) -> Any:
+        """Telethon-compatible lazy chat lookup."""
+
+        result = await self._raw_getter("get_chat")
+        if result is not None:
+            return result
+        for source in self._raw_sources():
+            chat = getattr(source, "chat", None)
+            if chat is not None:
+                return chat
+        return None
+
+    async def get_sender(self) -> Any:
+        """Telethon-compatible lazy sender lookup."""
+
+        result = await self._raw_getter("get_sender")
+        return result if result is not None else self.sender
 
     @property
     def is_reply(self) -> bool:
-        return bool(getattr(self.raw, "is_reply", False))
+        raw_message = getattr(self.raw, "message", None)
+        return bool(
+            getattr(self.raw, "is_reply", False)
+            or getattr(raw_message, "is_reply", False)
+            or self.reply_to_msg_id is not None
+        )
 
     @property
     def out(self) -> bool:
@@ -115,15 +299,38 @@ class Transport:
 
 
 class _StubClient:
-    """Минимальный клиент для setup(client) в офлайн-сборке: только копилка
-    обработчиков, без сети."""
+    """Small offline stand-in for a Telethon client.
 
-    def __init__(self) -> None:
+    Setup-style modules register event handlers on it, while core-style
+    handlers can access it through ``event.client``.  It deliberately keeps
+    network/RPC operations out of offline tests, but maps ordinary message and
+    file sends to :class:`NullTransport` so presentation-only commands can be
+    smoke-tested faithfully.
+    """
+
+    def __init__(self, transport: "NullTransport") -> None:
+        self._transport = transport
         self.handlers: List[Any] = []
+
+    def _chat_id(self, entity: Any) -> int:
+        if entity in (None, "me", "self"):
+            return self._transport.me_id
+        try:
+            return int(entity)
+        except (TypeError, ValueError):
+            return self._transport.me_id
 
     def add_event_handler(self, fn: Any, event: Any = None) -> Any:
         self.handlers.append((fn, event))
         return fn
+
+    def remove_event_handler(self, fn: Any, event: Any = None) -> None:
+        """Mirror Telethon cleanup so setup modules can be hot-unloaded offline."""
+
+        try:
+            self.handlers.remove((fn, event))
+        except ValueError:
+            pass
 
     def on(self, event: Any) -> Callable:
         def reg(fn: Any) -> Any:
@@ -134,11 +341,34 @@ class _StubClient:
 
     async def get_me(self) -> Any:
         class _Me:
-            id = 1000
             username = None
             first_name = "Hydra"
 
-        return _Me()
+        me = _Me()
+        me.id = self._transport.me_id
+        return me
+
+    async def send_message(self, entity: Any, text: str, **kw: Any) -> Message:
+        return await self._transport.send(self._chat_id(entity), text, **kw)
+
+    async def send_file(self, entity: Any, file: Any, **kw: Any) -> Message:
+        # NullTransport has no media store.  Preserve the visible caption so a
+        # UI command such as `.start` is still meaningfully testable.
+        caption = kw.pop("caption", None)
+        text = str(caption if caption is not None else file)
+        return await self._transport.send(self._chat_id(entity), text, **kw)
+
+    async def edit_message(self, entity: Any, message: Any, text: str, **kw: Any) -> Message:
+        message_id = message if isinstance(message, int) else getattr(message, "id", 0)
+        return await self._transport.edit(self._chat_id(entity), int(message_id or 0), text, **kw)
+
+    async def delete_messages(self, entity: Any, messages: Any, **kw: Any) -> list[Any]:
+        ids = messages if isinstance(messages, (list, tuple, set)) else [messages]
+        for message in ids:
+            message_id = message if isinstance(message, int) else getattr(message, "id", 0)
+            if message_id:
+                await self._transport.delete(self._chat_id(entity), int(message_id))
+        return []
 
 
 class NullTransport(Transport):
@@ -172,7 +402,7 @@ class NullTransport(Transport):
     def client(self) -> Any:
         """Stub-клиент для setup(client)-модулей в офлайн-режиме."""
         if getattr(self, "_stub_client", None) is None:
-            self._stub_client = _StubClient()
+            self._stub_client = _StubClient(self)
         return self._stub_client
 
     async def send(self, chat_id: int, text: str, **kw: Any) -> Message:
@@ -190,11 +420,17 @@ class NullTransport(Transport):
         return msg
 
     async def edit(self, chat_id: int, message_id: int, text: str, **kw: Any) -> Message:
+        buttons_supplied = "buttons" in kw
+        buttons = kw.pop("buttons", None)
         for m in self.sent:
             if m.chat_id == chat_id and m.message_id == message_id:
                 m.text = text
+                if buttons_supplied:
+                    m.buttons = buttons
                 self._decorate_menu(m)
                 return m
+        if buttons_supplied:
+            kw["buttons"] = buttons
         return await self.send(chat_id, text, **kw)
 
     def _decorate_menu(self, msg: "Message") -> None:
@@ -236,6 +472,7 @@ class NullTransport(Transport):
         text: str,
         sender_id: Optional[int] = None,
         outgoing: bool = False,
+        raw: Any = None,
     ) -> Message:
         """Симулировать входящее сообщение и раздать его подписчикам."""
         msg = Message(
@@ -244,6 +481,7 @@ class NullTransport(Transport):
             text=text,
             outgoing=outgoing,
             message_id=next(self._ids),
+            raw=raw,
             transport=self,
         )
         for rec in list(self._subs):
@@ -358,7 +596,26 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             self._client = TelegramClient(session, api_id, api_hash, **client_kw)
             self._own = True
         self._me_id = 0
-        self._unsubs: List[Callable[[], None]] = []
+        # One pair of native Telethon subscriptions fans out to all Hydra/MCUB
+        # handlers.  The old one-builder-per-command model created ~200
+        # callbacks for the owned command set on Android and hid which one was
+        # slow or faulty.
+        self._subs: List[Dict[str, Any]] = []
+        self._native_message_handlers: List[tuple[Any, Any]] = []
+        self._slow_handler_after = _milliseconds_from_env("HYDRA_SLOW_HANDLER_MS", 750)
+        self._slow_rpc_after = _milliseconds_from_env("HYDRA_SLOW_RPC_MS", 750)
+        self._diagnostics: Dict[str, Any] = {
+            "updates": 0,
+            "matched_handlers": 0,
+            "failed_handlers": 0,
+            "slow_handlers": 0,
+            "slow_updates": 0,
+            "slow_rpcs": 0,
+            "last_slow_handler": "",
+            "last_slow_update": "",
+            "last_slow_rpc": "",
+            "last_error": "",
+        }
         # текстовый мост кнопок (ButtonBridge): hook (msg) -> новый текст
         self.menu_renderer: Optional[Callable] = None
         # хук (msg, old_id): меню записалось с временным id, после отправки
@@ -370,8 +627,11 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             await self._client.start()
         me = await self._client.get_me()
         self._me_id = me.id
+        self._install_message_dispatchers()
 
     async def stop(self) -> None:
+        self._remove_message_dispatchers()
+        self._subs.clear()
         if self._own:
             await self._client.disconnect()
 
@@ -392,6 +652,14 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
         except Exception:  # noqa: BLE001 - мост не должен ронять отправку
             pass
 
+    def _record_rpc_timing(self, action: str, elapsed: float) -> None:
+        if elapsed < self._slow_rpc_after:
+            return
+        milliseconds = elapsed * 1000
+        self._diagnostics["slow_rpcs"] += 1
+        self._diagnostics["last_slow_rpc"] = f"{action}: {milliseconds:.0f} ms"
+        logger.warning("slow Telegram RPC %s: %.0f ms", action, milliseconds)
+
     async def send(self, chat_id: int, text: str, **kw: Any) -> Message:
         msg = Message(
             chat_id=chat_id,
@@ -403,7 +671,11 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             transport=self,
         )
         self._decorate_menu(msg)  # меню вшивается в текст ДО отправки в TG
-        raw = await self._client.send_message(chat_id, msg.text, **kw)
+        started = time.perf_counter()
+        try:
+            raw = await self._client.send_message(chat_id, msg.text, **kw)
+        finally:
+            self._record_rpc_timing("send_message", time.perf_counter() - started)
         old = msg.message_id
         msg.message_id = raw.id
         msg.raw = raw
@@ -422,12 +694,151 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             transport=self,
         )
         self._decorate_menu(msg)
-        raw = await self._client.edit_message(chat_id, message_id, msg.text, **kw)
+        started = time.perf_counter()
+        try:
+            raw = await self._client.edit_message(chat_id, message_id, msg.text, **kw)
+        finally:
+            self._record_rpc_timing("edit_message", time.perf_counter() - started)
         msg.raw = raw
         return msg
 
     async def delete(self, chat_id: int, message_id: int) -> None:
         await self._client.delete_messages(chat_id, message_id)
+
+    @staticmethod
+    def _event_to_message(event: Any, me_id: int, transport: "TelethonTransport") -> Message:
+        raw_message = getattr(event, "message", None)
+        is_outgoing = bool(getattr(event, "out", getattr(raw_message, "out", False)))
+        sender_id = getattr(event, "sender_id", None) or getattr(raw_message, "sender_id", None)
+        # Telegram occasionally omits sender_id for the account's own update.
+        if not sender_id and is_outgoing:
+            sender_id = me_id
+        text = (
+            getattr(event, "raw_text", None)
+            or getattr(event, "text", None)
+            or getattr(raw_message, "message", None)
+            or ""
+        )
+        return Message(
+            chat_id=getattr(event, "chat_id", 0) or 0,
+            sender_id=sender_id or 0,
+            text=str(text),
+            outgoing=is_outgoing,
+            message_id=getattr(raw_message, "id", getattr(event, "id", 0)) or 0,
+            raw=event,
+            transport=transport,
+        )
+
+    @staticmethod
+    def _subscription_matches(rec: Dict[str, Any], message: Message) -> bool:
+        if message.outgoing and not rec["outgoing"]:
+            return False
+        if not message.outgoing and not rec["incoming"]:
+            return False
+        chats = rec["chats"]
+        if chats is not None and message.chat_id not in chats:
+            return False
+        pattern = rec["pattern"]
+        if pattern is None:
+            return True
+        # Telethon's NewMessage(pattern=...) applies a regular-expression
+        # ``match`` (not a substring search), so preserve its command/watcher
+        # semantics while filtering inside the shared dispatcher.
+        matcher = getattr(pattern, "match", None)
+        return bool(matcher(message.text) if callable(matcher) else pattern(message.text))
+
+    async def _dispatch_message(self, event: Any) -> None:
+        message = self._event_to_message(event, self._me_id, self)
+        self._diagnostics["updates"] += 1
+        dispatch_started = time.perf_counter()
+        try:
+            for rec in tuple(self._subs):
+                if not self._subscription_matches(rec, message):
+                    continue
+                self._diagnostics["matched_handlers"] += 1
+                started = time.perf_counter()
+                try:
+                    await rec["handler"](message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate one broken module
+                    self._diagnostics["failed_handlers"] += 1
+                    self._diagnostics["last_error"] = (
+                        f"{rec['label']}: {type(exc).__name__}"
+                    )
+                    logger.exception("handler %s failed", rec["label"])
+                finally:
+                    elapsed = time.perf_counter() - started
+                    if elapsed >= self._slow_handler_after:
+                        milliseconds = elapsed * 1000
+                        self._diagnostics["slow_handlers"] += 1
+                        self._diagnostics["last_slow_handler"] = (
+                            f"{rec['label']}: {milliseconds:.0f} ms"
+                        )
+                        logger.warning("slow handler %s: %.0f ms", rec["label"], milliseconds)
+        finally:
+            elapsed = time.perf_counter() - dispatch_started
+            if elapsed >= self._slow_handler_after:
+                milliseconds = elapsed * 1000
+                self._diagnostics["slow_updates"] += 1
+                self._diagnostics["last_slow_update"] = f"{milliseconds:.0f} ms"
+                logger.warning(
+                    "slow update dispatch: %.0f ms (%s)",
+                    milliseconds,
+                    "outgoing" if message.outgoing else "incoming",
+                )
+
+    def _install_message_dispatchers(self) -> None:
+        if self._native_message_handlers:
+            return
+        for direction in ({"incoming": True}, {"outgoing": True}):
+            async def wrapper(event: Any) -> None:
+                await self._dispatch_message(event)
+
+            builder = events.NewMessage(**direction)
+            self._client.add_event_handler(wrapper, builder)
+            self._native_message_handlers.append((wrapper, builder))
+
+    def _remove_message_dispatchers(self) -> None:
+        remove = getattr(self._client, "remove_event_handler", None)
+        if callable(remove):
+            for callback, builder in self._native_message_handlers:
+                try:
+                    remove(callback, builder)
+                except Exception:  # noqa: BLE001 - shutdown remains best effort
+                    pass
+        self._native_message_handlers.clear()
+
+    def _client_new_message_handler_count(self) -> Optional[int]:
+        """Best-effort count of all live NewMessage handlers, including raw ones."""
+
+        list_handlers = getattr(self._client, "list_event_handlers", None)
+        if not callable(list_handlers):
+            return None
+        try:
+            registrations = list_handlers()
+            return sum(
+                1
+                for registration in registrations
+                if len(registration) > 1
+                and type(registration[1]).__name__ == "NewMessage"
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never affect updates
+            return None
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Small, secret-free runtime snapshot for `.diag` and logs."""
+
+        return {
+            **self._diagnostics,
+            "subscriptions": len(self._subs),
+            "patterned_subscriptions": sum(rec["pattern"] is not None for rec in self._subs),
+            "watcher_subscriptions": sum(rec["pattern"] is None for rec in self._subs),
+            "native_message_handlers": len(self._native_message_handlers),
+            "client_new_message_handlers": self._client_new_message_handler_count(),
+            "slow_handler_threshold_ms": int(self._slow_handler_after * 1000),
+            "slow_rpc_threshold_ms": int(self._slow_rpc_after * 1000),
+        }
 
     def subscribe(
         self,
@@ -438,26 +849,29 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
         outgoing: bool = False,
         chats: Optional[List[int]] = None,
     ) -> Callable[[], None]:
-        kw: Dict[str, Any] = {"incoming": incoming, "outgoing": outgoing}
+        """Register a logical subscription under two shared live dispatchers."""
+
+        if not incoming and not outgoing:
+            return lambda: None
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        label = getattr(handler, "__qualname__", getattr(handler, "__name__", "handler"))
         if pattern:
-            kw["pattern"] = pattern
-        if chats:
-            kw["chats"] = chats
+            label = f"{label} [{pattern}]"
+        rec = {
+            "handler": handler,
+            "pattern": compiled,
+            "incoming": incoming,
+            "outgoing": outgoing,
+            "chats": set(chats) if chats else None,
+            "label": label,
+        }
+        self._subs.append(rec)
 
-        async def wrapper(event: Any) -> None:
-            msg = Message(
-                chat_id=event.chat_id,
-                sender_id=event.sender_id or 0,
-                text=event.text or "",
-                outgoing=event.out,
-                message_id=event.message.id,
-                raw=event,
-                transport=self,
-            )
-            await handler(msg)
+        def unsubscribe() -> None:
+            if rec in self._subs:
+                self._subs.remove(rec)
 
-        self._client.on(events.NewMessage(**kw))(wrapper)
-        return lambda: None
+        return unsubscribe
 
     def subscribe_inline(self, handler: Callable) -> Callable[[], None]:  # pragma: no cover
         async def wrapper(event: Any) -> None:

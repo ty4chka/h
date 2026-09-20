@@ -17,34 +17,94 @@ def _get_real_kernel(kernel):
     return kernel
 
 
-def make_cb_button(kernel, text: str, callback, *, args=None, kwargs=None,
+# Глобальный реестр колбэков для вызовов в стиле MCUB-fork
+# make_cb_button(text, callback) — без явного kernel (как в upstream).
+_global_cb_handlers: dict = {}
+
+
+def _find_active_kernel():
+    """Найти активное ядро MCUB для привязки токена к его callback map."""
+    try:
+        import core_inline as _root
+
+        state = getattr(_root, "_core", None)
+        bot = getattr(state, "bot", None)
+        kernel = getattr(bot, "kernel", None) or getattr(bot, "_kernel", None)
+        if kernel is not None:
+            return kernel
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _store_global_cb(tok: str, entry: dict) -> None:
+    now = time.time()
+    expired = [
+        k for k, v in list(_global_cb_handlers.items())
+        if v.get("expires_at") and v["expires_at"] < now
+    ]
+    for k in expired:
+        _global_cb_handlers.pop(k, None)
+    _global_cb_handlers[tok] = entry
+
+
+def default_ttl(ttl: int | None) -> int:
+    """TTL по умолчанию (MCUB-fork совместимость)."""
+
+    try:
+        return int(ttl) if ttl else 900
+    except (TypeError, ValueError):
+        return 900
+
+
+def make_cb_button(*call_args, args=None, kwargs=None,
                    ttl: int = 900, token: str | None = None, icon: Any = None,
                    style: Any = None):
-    """Создать Button.inline с автогенерацией токена колбэка."""
+    """Создать Button.inline с автогенерацией токена колбэка.
+
+    Реальная сигнатура MCUB-fork: ``make_cb_button(text, callback)``.
+    Ранее в Hydra использовался вызов ``make_cb_button(kernel, text, callback)``;
+    обе формы поддерживаются.
+    """
+    if len(call_args) == 2 and isinstance(call_args[0], str) and callable(call_args[1]):
+        kernel, text, callback = _find_active_kernel(), call_args[0], call_args[1]
+    elif len(call_args) >= 3:
+        kernel, text, callback = call_args[0], call_args[1], call_args[2]
+    elif len(call_args) == 2 and callable(call_args[0]) is False:
+        raise TypeError("make_cb_button: ожидается (text, callback) или (kernel, text, callback)")
+    else:
+        raise TypeError("make_cb_button: ожидается (text, callback) или (kernel, text, callback)")
+
     if not callable(callback):
         raise TypeError("callback must be callable")
 
-    real_kernel = _get_real_kernel(kernel)
-    if not hasattr(real_kernel, "_inline_cb_lock"):
-        real_kernel._inline_cb_lock = threading.Lock()
+    tok = token or uuid.uuid4().hex
+    now = time.time()
+    entry = {
+        "handler": callback,
+        "args": list(args or []),
+        "kwargs": dict(kwargs or {}),
+        "expires_at": now + default_ttl(ttl) if ttl else None,
+    }
+    if kernel is None:
+        # Режим upstream без явного ядра: глобальный реестр-мост.
+        _store_global_cb(tok, entry)
+        real_kernel = None
+    else:
+        real_kernel = _get_real_kernel(kernel)
+        if not hasattr(real_kernel, "_inline_cb_lock"):
+            real_kernel._inline_cb_lock = threading.Lock()
 
-    with real_kernel._inline_cb_lock:
-        cb_map = getattr(real_kernel, "inline_callback_map", None)
-        if cb_map is None:
-            cb_map = {}
-            real_kernel.inline_callback_map = cb_map
-        now = time.time()
-        expired = [k for k, v in list(cb_map.items())
-                   if v.get("expires_at") and v["expires_at"] < now]
-        for k in expired:
-            cb_map.pop(k, None)
-        tok = token or uuid.uuid4().hex
-        cb_map[tok] = {
-            "handler": callback,
-            "args": list(args or []),
-            "kwargs": dict(kwargs or {}),
-            "expires_at": now + ttl if ttl else None,
-        }
+        with real_kernel._inline_cb_lock:
+            cb_map = getattr(real_kernel, "inline_callback_map", None)
+            if cb_map is None:
+                cb_map = {}
+                real_kernel.inline_callback_map = cb_map
+            expired = [k for k, v in list(cb_map.items())
+                       if v.get("expires_at") and v["expires_at"] < now]
+            for k in expired:
+                cb_map.pop(k, None)
+            cb_map[tok] = entry
 
     from telethon import Button
     try:

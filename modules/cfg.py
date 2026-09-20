@@ -462,7 +462,8 @@ async def _show_help(event, topic: str = ""):
 
 def setup(client):
     _load_all()
-    client.add_event_handler(cfg_handler, events.NewMessage(pattern=r"\.cfg", outgoing=True))
+    # Do not claim unrelated commands that merely start with `.cfg`.
+    client.add_event_handler(cfg_handler, events.NewMessage(pattern=r"(?i)^\.cfg(?:\s|$)", outgoing=True))
 
 
 modules_help = {

@@ -7,6 +7,7 @@ Tokyo Night TUI with Tabbed Account Manager + Multi-Theme + Vim Navigation
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import time
 import sys
@@ -36,7 +37,7 @@ except ImportError:
     from telethon import TelegramClient
     MCUB_READY = False
 
-from telethon import connection
+from hydra_kernel.mtproxy import connection_class_for_secret
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -590,21 +591,49 @@ os.environ.update({
     'PREFIX': '/data/data/com.termux/files/usr',
 })
 
-sys.path.insert(0, '/data/data/com.termux/files/usr/lib/python3.12/site-packages')
-sys.path.insert(0, '/data/data/com.termux/files/home/.local/lib/python3.12/site-packages')
-sys.path.insert(0, str(Path.cwd()))
+# Python already puts this script's directory on sys.path.  Do not inject a
+# fixed Termux Python 3.12 site-packages directory here: on newer interpreters
+# it can mix stale binary/dependency versions with the active environment.
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-LOG_FILE = Path("data/hydra.log")
+LOG_FILE = PROJECT_ROOT / "data" / "hydra.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+_log_format = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+_file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=2 * 1024 * 1024,
+    backupCount=3,
+    encoding='utf-8',
+)
+_file_handler.setLevel(logging.INFO)
+_console_handler = logging.StreamHandler(sys.stdout)
+# The TUI remains usable while the full diagnostic timeline is saved to file.
+_console_handler.setLevel(logging.WARNING)
 logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    level=logging.INFO,
+    format=_log_format,
+    handlers=[_file_handler, _console_handler],
+    # A dependency must not be able to install a warning-only root logger
+    # before Hydra and silently discard the rotating diagnostic file.
+    force=True,
 )
 logger = logging.getLogger("hydra")
+logger.info(
+    "logging initialized | Python %s | executable=%s | log=%s",
+    sys.version.split()[0],
+    sys.executable,
+    LOG_FILE,
+)
+try:
+    _free_bytes = shutil.disk_usage(PROJECT_ROOT).free
+    if _free_bytes < 256 * 1024 * 1024:
+        logger.error(
+            "critically low disk space: %.1f MiB free under %s; SQLite/logs/cache can stall",
+            _free_bytes / (1024 * 1024),
+            PROJECT_ROOT,
+        )
+except OSError:
+    pass
 
 start_time = time.time()
 set_start_time(start_time)
@@ -1841,7 +1870,9 @@ def get_client_kwargs(session_name, proxy_enabled=False):
     }
     if proxy_enabled and hasattr(config, 'PROXY') and config.PROXY:
         kwargs["proxy"] = (config.PROXY["addr"], config.PROXY["port"], config.PROXY["secret"])
-        kwargs["connection"] = connection.ConnectionTcpMTProxyIntermediate
+        # ``ee`` links need a FakeTLS record handshake before Telethon's
+        # normal randomized-intermediate MTProto transport starts.
+        kwargs["connection"] = connection_class_for_secret(config.PROXY["secret"])
     return kwargs
 
 
@@ -1915,12 +1946,20 @@ async def action_view_logs():
         return
 
     try:
-        with open(LOG_FILE, 'r') as f:
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        last_lines = lines[-20:] if len(lines) > 20 else lines
+        # A traceback is multi-line.  Showing only the last 20 lines often
+        # omitted the actual ERROR line and made failures look mysterious.
+        tail = lines[-160:]
+        error_starts = [
+            index for index, line in enumerate(tail)
+            if " | ERROR " in line or " | CRITICAL " in line
+        ]
+        last_lines = tail[error_starts[-1]:] if error_starts else tail[-60:]
+        last_lines = last_lines[-100:]
 
         UI.clear()
-        console.print(f"[bold {Theme.BLUE}]📋 Last Log Entries[/]")
+        console.print(f"[bold {Theme.BLUE}]📋 Diagnostic Log[/]")
         console.print(Rule(style=Theme.BORDER))
 
         for line in last_lines:
@@ -2328,6 +2367,9 @@ async def boot_hydra(account_name, account_data):
             await client.start()
         me = await client.get_me()
     except Exception as e:
+        # Keep the UI concise, but preserve the transport traceback (including
+        # proxy/TLS failures) in the rotating diagnostic log.
+        logger.exception("Telegram connection failed for account %s", account_name)
         UI.error(f"Connection failed: {e}")
         return
 
@@ -2391,36 +2433,46 @@ async def boot_hydra(account_name, account_data):
 
     stop = asyncio.Event()
 
+    def _read_hotkey(fd: int) -> str:
+        """Blocking terminal read executed outside Telethon's event loop."""
+
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        return sys.stdin.read(1) if ready else ""
+
     async def _hotkeys():
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
             while not stop.is_set():
-                if select.select([sys.stdin], [], [], 0.2)[0]:
-                    key = sys.stdin.read(1).lower()
-                    if key == "q":
-                        stop.set()
-                        return
-                    if key == "r":
-                        recs, errs = await dispatcher.reload_all()
-                        for n, e in errs:
-                            UI.error(f"{n}: {e}")
-                        UI.success(
-                            f"reloaded {len(recs)} modules "
-                            f"(boot: {dispatcher.BOOT_TIME:.2f}s)"
-                        )
-                        _redraw(recs, errs)
-                        tty.setcbreak(fd)
-                    elif key == "e":
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                        subprocess.run(
-                            [sys.executable, "-m", "hydra_kernel.tui", "modules"]
-                        )
-                        recs, errs = await dispatcher.reload_all()
-                        _redraw(recs, errs)
-                        tty.setcbreak(fd)
-                await asyncio.sleep(0)
+                # select(..., 0.2) used to run directly in this coroutine,
+                # freezing *all* Telegram updates for up to 200 ms every pass.
+                # The terminal wait has no Telegram state, so move only that
+                # blocking read to the default worker pool.
+                key = (await asyncio.to_thread(_read_hotkey, fd)).lower()
+                if not key:
+                    continue
+                if key == "q":
+                    stop.set()
+                    return
+                if key == "r":
+                    recs, errs = await dispatcher.reload_all()
+                    for n, e in errs:
+                        UI.error(f"{n}: {e}")
+                    UI.success(
+                        f"reloaded {len(recs)} modules "
+                        f"(boot: {dispatcher.BOOT_TIME:.2f}s)"
+                    )
+                    _redraw(recs, errs)
+                    tty.setcbreak(fd)
+                elif key == "e":
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    subprocess.run(
+                        [sys.executable, "-m", "hydra_kernel.tui", "modules"]
+                    )
+                    recs, errs = await dispatcher.reload_all()
+                    _redraw(recs, errs)
+                    tty.setcbreak(fd)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 

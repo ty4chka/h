@@ -103,11 +103,16 @@ class Lifecycle:
                 try:
                     await _fn(event)
                 except Exception as e:  # noqa: BLE001
-                    logger.error("command %s failed: %s", meta["name"], e)
+                    logger.exception("command %s failed", meta["name"])
                     try:
                         await event.reply(f"<b>Error:</b> <code>{str(e)[:100]}</code>")
                     except Exception:  # pragma: no cover
                         pass
+
+            # MCUB-совместимый man узнаёт владельца команды по привязке
+            # (как у MCUB-модулей, иначе нативные выглядят «no commands»).
+            wrapper.__original__ = fn  # type: ignore[attr-defined]
+            wrapper.__bound_instance__ = module  # type: ignore[attr-defined]
 
             self._unsubs.append(
                 module.ctx.transport.subscribe(wrapper, pattern=pattern, outgoing=True, incoming=True)
@@ -122,8 +127,8 @@ class Lifecycle:
         async def wrapper(event: Message) -> None:
             try:
                 await fn(event)
-            except Exception as e:  # noqa: BLE001
-                logger.error("watcher of %s failed: %s", module.name, e)
+            except Exception:  # noqa: BLE001
+                logger.exception("watcher of %s failed", module.name)
 
         self._unsubs.append(
             module.ctx.transport.subscribe(
@@ -145,8 +150,8 @@ class Lifecycle:
                     await fn()
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:  # noqa: BLE001
-                    logger.error("loop of %s failed: %s", module.name, e)
+                except Exception:  # noqa: BLE001
+                    logger.exception("loop of %s failed", module.name)
 
         self._tasks.append(asyncio.create_task(runner()))
 
@@ -156,5 +161,5 @@ class Lifecycle:
             return
         try:
             await hook()
-        except Exception as e:  # noqa: BLE001
-            logger.error("hook %r failed: %s", hook, e)
+        except Exception:  # noqa: BLE001
+            logger.exception("hook %r failed", hook)

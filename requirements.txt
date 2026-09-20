@@ -1,6 +1,8 @@
 # === ЯДРО ===
 telethon>=1.35.0
 rich>=13.0.0
+# YAML — языковые паки/архивы модулей MCUB (translations и др.)
+PyYAML>=6.0.0
 
 # === CYTHON ===
 cython>=3.0.0
@@ -22,13 +24,17 @@ python-multipart>=0.0.9
 ptyprocess>=0.7.0
 
 # === СИСТЕМНАЯ ИНФОРМАЦИЯ ===
-psutil>=5.9.0
+# Не ставим psutil через pip на Android/Termux: некоторые версии не
+# поддерживают platform=android. Ядро использует безопасный fallback.
+psutil>=5.9.0; sys_platform != "android"
 
 # === AI КОНВЕРТЕР ===
 aiohttp>=3.9.0  # уже указан выше
 
 # === УТИЛИТЫ ===
 pillow>=10.0.0  # PIL для yamusic и других модулей
+requests>=2.31.0  # загрузка файлов в k:uploader
+httpx>=0.27.0  # AI-анализатор ReadFile MCUB
 
 # === ДЕВ / СБОРКА ===
 setuptools>=69.0.0
