@@ -10,11 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 Handler = Callable[["Message"], Awaitable[None]]
+logger = logging.getLogger("hydra_kernel.transport")
+
+
+def _milliseconds_from_env(name: str, default: float) -> float:
+    """Read a positive timing threshold without letting a bad env break boot."""
+
+    try:
+        return max(1.0, float(os.environ.get(name, default))) / 1000.0
+    except (TypeError, ValueError):
+        return default / 1000.0
 
 
 @dataclass
@@ -583,7 +596,26 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             self._client = TelegramClient(session, api_id, api_hash, **client_kw)
             self._own = True
         self._me_id = 0
-        self._unsubs: List[Callable[[], None]] = []
+        # One pair of native Telethon subscriptions fans out to all Hydra/MCUB
+        # handlers.  The old one-builder-per-command model created ~200
+        # callbacks for the owned command set on Android and hid which one was
+        # slow or faulty.
+        self._subs: List[Dict[str, Any]] = []
+        self._native_message_handlers: List[tuple[Any, Any]] = []
+        self._slow_handler_after = _milliseconds_from_env("HYDRA_SLOW_HANDLER_MS", 750)
+        self._slow_rpc_after = _milliseconds_from_env("HYDRA_SLOW_RPC_MS", 750)
+        self._diagnostics: Dict[str, Any] = {
+            "updates": 0,
+            "matched_handlers": 0,
+            "failed_handlers": 0,
+            "slow_handlers": 0,
+            "slow_updates": 0,
+            "slow_rpcs": 0,
+            "last_slow_handler": "",
+            "last_slow_update": "",
+            "last_slow_rpc": "",
+            "last_error": "",
+        }
         # текстовый мост кнопок (ButtonBridge): hook (msg) -> новый текст
         self.menu_renderer: Optional[Callable] = None
         # хук (msg, old_id): меню записалось с временным id, после отправки
@@ -595,8 +627,11 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             await self._client.start()
         me = await self._client.get_me()
         self._me_id = me.id
+        self._install_message_dispatchers()
 
     async def stop(self) -> None:
+        self._remove_message_dispatchers()
+        self._subs.clear()
         if self._own:
             await self._client.disconnect()
 
@@ -617,6 +652,14 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
         except Exception:  # noqa: BLE001 - мост не должен ронять отправку
             pass
 
+    def _record_rpc_timing(self, action: str, elapsed: float) -> None:
+        if elapsed < self._slow_rpc_after:
+            return
+        milliseconds = elapsed * 1000
+        self._diagnostics["slow_rpcs"] += 1
+        self._diagnostics["last_slow_rpc"] = f"{action}: {milliseconds:.0f} ms"
+        logger.warning("slow Telegram RPC %s: %.0f ms", action, milliseconds)
+
     async def send(self, chat_id: int, text: str, **kw: Any) -> Message:
         msg = Message(
             chat_id=chat_id,
@@ -628,7 +671,11 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             transport=self,
         )
         self._decorate_menu(msg)  # меню вшивается в текст ДО отправки в TG
-        raw = await self._client.send_message(chat_id, msg.text, **kw)
+        started = time.perf_counter()
+        try:
+            raw = await self._client.send_message(chat_id, msg.text, **kw)
+        finally:
+            self._record_rpc_timing("send_message", time.perf_counter() - started)
         old = msg.message_id
         msg.message_id = raw.id
         msg.raw = raw
@@ -647,12 +694,151 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
             transport=self,
         )
         self._decorate_menu(msg)
-        raw = await self._client.edit_message(chat_id, message_id, msg.text, **kw)
+        started = time.perf_counter()
+        try:
+            raw = await self._client.edit_message(chat_id, message_id, msg.text, **kw)
+        finally:
+            self._record_rpc_timing("edit_message", time.perf_counter() - started)
         msg.raw = raw
         return msg
 
     async def delete(self, chat_id: int, message_id: int) -> None:
         await self._client.delete_messages(chat_id, message_id)
+
+    @staticmethod
+    def _event_to_message(event: Any, me_id: int, transport: "TelethonTransport") -> Message:
+        raw_message = getattr(event, "message", None)
+        is_outgoing = bool(getattr(event, "out", getattr(raw_message, "out", False)))
+        sender_id = getattr(event, "sender_id", None) or getattr(raw_message, "sender_id", None)
+        # Telegram occasionally omits sender_id for the account's own update.
+        if not sender_id and is_outgoing:
+            sender_id = me_id
+        text = (
+            getattr(event, "raw_text", None)
+            or getattr(event, "text", None)
+            or getattr(raw_message, "message", None)
+            or ""
+        )
+        return Message(
+            chat_id=getattr(event, "chat_id", 0) or 0,
+            sender_id=sender_id or 0,
+            text=str(text),
+            outgoing=is_outgoing,
+            message_id=getattr(raw_message, "id", getattr(event, "id", 0)) or 0,
+            raw=event,
+            transport=transport,
+        )
+
+    @staticmethod
+    def _subscription_matches(rec: Dict[str, Any], message: Message) -> bool:
+        if message.outgoing and not rec["outgoing"]:
+            return False
+        if not message.outgoing and not rec["incoming"]:
+            return False
+        chats = rec["chats"]
+        if chats is not None and message.chat_id not in chats:
+            return False
+        pattern = rec["pattern"]
+        if pattern is None:
+            return True
+        # Telethon's NewMessage(pattern=...) applies a regular-expression
+        # ``match`` (not a substring search), so preserve its command/watcher
+        # semantics while filtering inside the shared dispatcher.
+        matcher = getattr(pattern, "match", None)
+        return bool(matcher(message.text) if callable(matcher) else pattern(message.text))
+
+    async def _dispatch_message(self, event: Any) -> None:
+        message = self._event_to_message(event, self._me_id, self)
+        self._diagnostics["updates"] += 1
+        dispatch_started = time.perf_counter()
+        try:
+            for rec in tuple(self._subs):
+                if not self._subscription_matches(rec, message):
+                    continue
+                self._diagnostics["matched_handlers"] += 1
+                started = time.perf_counter()
+                try:
+                    await rec["handler"](message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate one broken module
+                    self._diagnostics["failed_handlers"] += 1
+                    self._diagnostics["last_error"] = (
+                        f"{rec['label']}: {type(exc).__name__}"
+                    )
+                    logger.exception("handler %s failed", rec["label"])
+                finally:
+                    elapsed = time.perf_counter() - started
+                    if elapsed >= self._slow_handler_after:
+                        milliseconds = elapsed * 1000
+                        self._diagnostics["slow_handlers"] += 1
+                        self._diagnostics["last_slow_handler"] = (
+                            f"{rec['label']}: {milliseconds:.0f} ms"
+                        )
+                        logger.warning("slow handler %s: %.0f ms", rec["label"], milliseconds)
+        finally:
+            elapsed = time.perf_counter() - dispatch_started
+            if elapsed >= self._slow_handler_after:
+                milliseconds = elapsed * 1000
+                self._diagnostics["slow_updates"] += 1
+                self._diagnostics["last_slow_update"] = f"{milliseconds:.0f} ms"
+                logger.warning(
+                    "slow update dispatch: %.0f ms (%s)",
+                    milliseconds,
+                    "outgoing" if message.outgoing else "incoming",
+                )
+
+    def _install_message_dispatchers(self) -> None:
+        if self._native_message_handlers:
+            return
+        for direction in ({"incoming": True}, {"outgoing": True}):
+            async def wrapper(event: Any) -> None:
+                await self._dispatch_message(event)
+
+            builder = events.NewMessage(**direction)
+            self._client.add_event_handler(wrapper, builder)
+            self._native_message_handlers.append((wrapper, builder))
+
+    def _remove_message_dispatchers(self) -> None:
+        remove = getattr(self._client, "remove_event_handler", None)
+        if callable(remove):
+            for callback, builder in self._native_message_handlers:
+                try:
+                    remove(callback, builder)
+                except Exception:  # noqa: BLE001 - shutdown remains best effort
+                    pass
+        self._native_message_handlers.clear()
+
+    def _client_new_message_handler_count(self) -> Optional[int]:
+        """Best-effort count of all live NewMessage handlers, including raw ones."""
+
+        list_handlers = getattr(self._client, "list_event_handlers", None)
+        if not callable(list_handlers):
+            return None
+        try:
+            registrations = list_handlers()
+            return sum(
+                1
+                for registration in registrations
+                if len(registration) > 1
+                and type(registration[1]).__name__ == "NewMessage"
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never affect updates
+            return None
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Small, secret-free runtime snapshot for `.diag` and logs."""
+
+        return {
+            **self._diagnostics,
+            "subscriptions": len(self._subs),
+            "patterned_subscriptions": sum(rec["pattern"] is not None for rec in self._subs),
+            "watcher_subscriptions": sum(rec["pattern"] is None for rec in self._subs),
+            "native_message_handlers": len(self._native_message_handlers),
+            "client_new_message_handlers": self._client_new_message_handler_count(),
+            "slow_handler_threshold_ms": int(self._slow_handler_after * 1000),
+            "slow_rpc_threshold_ms": int(self._slow_rpc_after * 1000),
+        }
 
     def subscribe(
         self,
@@ -663,68 +849,27 @@ class TelethonTransport(Transport):  # pragma: no cover - нужна сеть/te
         outgoing: bool = False,
         chats: Optional[List[int]] = None,
     ) -> Callable[[], None]:
-        """Подписать L0 handler на одно или оба направления сообщений.
+        """Register a logical subscription under two shared live dispatchers."""
 
-        Telethon считает ``NewMessage(incoming=True, outgoing=True)``
-        взаимоисключающим фильтром: такая подписка не получает *ни одного*
-        события. Hydra использует обе стороны для команд/моста кнопок, поэтому
-        разворачиваем этот случай в две корректные Telethon-подписки.
-        """
-
-        base_kw: Dict[str, Any] = {}
-        if pattern:
-            base_kw["pattern"] = pattern
-        if chats:
-            base_kw["chats"] = chats
-
-        directions: List[Dict[str, bool]] = []
-        if incoming:
-            directions.append({"incoming": True})
-        if outgoing:
-            directions.append({"outgoing": True})
-        if not directions:
+        if not incoming and not outgoing:
             return lambda: None
-
-        async def wrapper(event: Any) -> None:
-            raw_message = getattr(event, "message", None)
-            is_outgoing = bool(getattr(event, "out", getattr(raw_message, "out", False)))
-            sender_id = getattr(event, "sender_id", None) or getattr(raw_message, "sender_id", None)
-            # Telegram иногда не заполняет sender_id у собственного outgoing
-            # сообщения. Иначе PermissionManager бесшумно отбросит команду.
-            if not sender_id and is_outgoing:
-                sender_id = self._me_id
-            text = (
-                getattr(event, "raw_text", None)
-                or getattr(event, "text", None)
-                or getattr(raw_message, "message", None)
-                or ""
-            )
-            msg = Message(
-                chat_id=getattr(event, "chat_id", 0) or 0,
-                sender_id=sender_id or 0,
-                text=str(text),
-                outgoing=is_outgoing,
-                message_id=getattr(raw_message, "id", getattr(event, "id", 0)) or 0,
-                raw=event,
-                transport=self,
-            )
-            await handler(msg)
-
-        registrations: List[Any] = []
-        for direction in directions:
-            builder = events.NewMessage(**base_kw, **direction)
-            self._client.add_event_handler(wrapper, builder)
-            registrations.append(builder)
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        label = getattr(handler, "__qualname__", getattr(handler, "__name__", "handler"))
+        if pattern:
+            label = f"{label} [{pattern}]"
+        rec = {
+            "handler": handler,
+            "pattern": compiled,
+            "incoming": incoming,
+            "outgoing": outgoing,
+            "chats": set(chats) if chats else None,
+            "label": label,
+        }
+        self._subs.append(rec)
 
         def unsubscribe() -> None:
-            remove = getattr(self._client, "remove_event_handler", None)
-            if not callable(remove):
-                return
-            for builder in registrations:
-                try:
-                    remove(wrapper, builder)
-                except Exception:  # noqa: BLE001 - cleanup must stay best-effort
-                    pass
+            if rec in self._subs:
+                self._subs.remove(rec)
 
         return unsubscribe
 

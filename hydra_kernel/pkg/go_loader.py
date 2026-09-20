@@ -130,7 +130,7 @@ class GoLoader:
                 )
                 await self._respond(mod, event, resp, edit=False)
             except Exception as e:  # noqa: BLE001
-                logger.error("go %s.%s: %s", mod.name, cmd, e)
+                logger.exception("go %s.%s failed", mod.name, cmd)
                 await event.reply(f"<b>Error:</b> <code>{str(e)[:100]}</code>")
 
         return handler

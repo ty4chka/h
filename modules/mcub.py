@@ -72,8 +72,8 @@ async def reload_all():
     for name in list(getattr(hydra.registry, "_records", {}).keys()):
         try:
             await hydra.loader.unload(name)
-        except Exception as e:  # noqa: BLE001
-            logger.error("unload %s: %s", name, e)
+        except Exception:  # noqa: BLE001
+            logger.exception("unload %s failed", name)
     t0 = time.monotonic()
     records, errors = await _load_owned_modules(hydra)
     global BOOT_TIME
@@ -110,10 +110,29 @@ async def _boot(client) -> None:
         records, errors = await _load_owned_modules(hydra)
         BOOT_TIME = time.monotonic() - t0
         for name, err in errors:
-            logger.error("engine: модуль %s не встал: %s", name, err)
+            logger.error(
+                "engine: module %s failed to load: %s",
+                name,
+                err,
+                exc_info=(type(err), err, getattr(err, "__traceback__", None)),
+            )
         _HYDRA = hydra
         _RESULT = (records, errors)
-        logger.info("single engine online: %d модулей", len(records))
+        diagnostics = getattr(hydra.transport, "diagnostics", None)
+        try:
+            metrics = diagnostics() if callable(diagnostics) else {}
+        except Exception:  # noqa: BLE001 - metrics must never block boot
+            metrics = {}
+        if metrics:
+            logger.info(
+                "single engine online: %d modules | logical=%s | shared NewMessage=%s | client NewMessage=%s",
+                len(records),
+                metrics.get("subscriptions", "?"),
+                metrics.get("native_message_handlers", "?"),
+                metrics.get("client_new_message_handlers", "?"),
+            )
+        else:
+            logger.info("single engine online: %d modules", len(records))
     except Exception as e:  # noqa: BLE001 — не роняем бота из-за ядра
         logger.error("engine boot error: %s", e, exc_info=True)
         _RESULT = ([], [(type(e).__name__, e)])

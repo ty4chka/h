@@ -555,8 +555,8 @@ class DragonAdapter(HikkaLikeAdapter):
             async def wrapper(event: Any, _fn=fn) -> None:
                 try:
                     await _fn(client_stub, event)
-                except Exception as e:  # noqa: BLE001
-                    logger.error("dragon %s failed: %s", name, e)
+                except Exception:  # noqa: BLE001
+                    logger.exception("dragon %s failed", name)
 
             if commands:
                 alts = "|".join(re.escape(c) for c in commands)

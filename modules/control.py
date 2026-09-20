@@ -108,6 +108,48 @@ class Control(ModuleBase):
             "<i>.modules — модули · .allcmds — команды · .find &lt;текст&gt;</i>"
         )
 
+    @command("diag", desc="диагностика маршрутизации и задержек", required_level=OWNER)
+    async def cmd_diag(self, event) -> None:
+        """Show bounded, non-secret transport counters for live diagnosis."""
+
+        getter = getattr(self.ctx.transport, "diagnostics", None)
+        snapshot = getter() if callable(getter) else {}
+        if not snapshot:
+            await event.edit(
+                "<b>🩺 HYDRA diagnostics</b>\n"
+                "<blockquote>Этот транспорт не публикует live-метрики.</blockquote>\n"
+                "<i>Полные ошибки: data/hydra.log</i>"
+            )
+            return
+
+        def value(name: str, default: str = "—") -> str:
+            raw = snapshot.get(name, default)
+            return _escape(default if raw is None else raw)
+
+        await event.edit(
+            "<b>🩺 HYDRA diagnostics</b>\n"
+            "<blockquote>"
+            f"📨 Updates: <code>{value('updates', 0)}</code> · matched: "
+            f"<code>{value('matched_handlers', 0)}</code>\n"
+            f"🧩 Logical subscriptions: <code>{value('subscriptions', 0)}</code> "
+            f"(<code>{value('patterned_subscriptions', 0)}</code> pattern, "
+            f"<code>{value('watcher_subscriptions', 0)}</code> watcher)\n"
+            f"🔌 shared native handlers: <code>{value('native_message_handlers', 0)}</code> · "
+            f"all client NewMessage: <code>{value('client_new_message_handlers', '?')}</code>\n"
+            f"⚠️ Handler errors: <code>{value('failed_handlers', 0)}</code> · "
+            f"slow handlers: <code>{value('slow_handlers', 0)}</code> · "
+            f"slow updates: <code>{value('slow_updates', 0)}</code>\n"
+            f"📡 Slow Telegram RPCs: <code>{value('slow_rpcs', 0)}</code>\n"
+            f"⏱ Thresholds: handler <code>{value('slow_handler_threshold_ms')} ms</code>, "
+            f"RPC <code>{value('slow_rpc_threshold_ms')} ms</code>"
+            "</blockquote>\n"
+            f"<b>Last slow handler:</b> <code>{value('last_slow_handler')}</code>\n"
+            f"<b>Last slow update:</b> <code>{value('last_slow_update')}</code>\n"
+            f"<b>Last slow RPC:</b> <code>{value('last_slow_rpc')}</code>\n"
+            f"<b>Last handler error:</b> <code>{value('last_error')}</code>\n\n"
+            "<i>Full traces: data/hydra.log · thresholds: HYDRA_SLOW_HANDLER_MS / HYDRA_SLOW_RPC_MS</i>"
+        )
+
     @command("modules", desc="список загруженных модулей", required_level=OWNER)
     async def cmd_modules(self, event) -> None:
         query = self.args_raw(event).strip().lower()

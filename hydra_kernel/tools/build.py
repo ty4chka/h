@@ -252,11 +252,12 @@ def check_stale_native_lang_fallback() -> None:
 
 
 async def check_telethon_both_direction_subscription() -> None:
-    """Реальный Telethon запрещает incoming=True вместе с outgoing=True.
+    """Live transport fans out through exactly two legal Telethon builders.
 
-    NullTransport намеренно принимает оба флага, поэтому здесь подменяем только
-    API Telethon минимальным клиентом. Проверка ловит регрессию, при которой
-    живые команды загрузятся, но никогда не получат Telegram-событие.
+    Telethon rejects ``incoming=True, outgoing=True`` in one builder.  Hydra
+    therefore owns one incoming and one outgoing builder and filters logical
+    subscriptions in-process, rather than registering one native callback per
+    command.
     """
 
     import types
@@ -286,6 +287,12 @@ async def check_telethon_both_direction_subscription() -> None:
         def remove_event_handler(self, callback, builder):
             self.removed.append((callback, builder))
 
+        def list_event_handlers(self):
+            return list(self.handlers)
+
+        async def send_message(self, _chat_id, _text, **_kw):
+            return types.SimpleNamespace(id=999)
+
     old_have = transport_module._HAVE_TELETHON
     old_events = transport_module.events
     transport_module._HAVE_TELETHON = True
@@ -303,10 +310,12 @@ async def check_telethon_both_direction_subscription() -> None:
             handler, pattern=r"^\.ping$", incoming=True, outgoing=True
         )
         builders = [builder.kwargs for _, builder in client.handlers]
-        assert builders == [
-            {"pattern": r"^\.ping$", "incoming": True},
-            {"pattern": r"^\.ping$", "outgoing": True},
-        ], builders
+        assert builders == [{"incoming": True}, {"outgoing": True}], builders
+        assert transport.diagnostics()["subscriptions"] == 1
+        # Adding logical commands must not multiply native Telethon callbacks.
+        for _ in range(20):
+            transport.subscribe(handler, pattern=r"^\.other$", incoming=True, outgoing=True)
+        assert len(client.handlers) == 2, client.handlers
 
         # Неполный sender_id — частый вид собственного события Telethon.
         outgoing = types.SimpleNamespace(
@@ -337,8 +346,35 @@ async def check_telethon_both_direction_subscription() -> None:
             2000, False, 78, ".ping",
         ), msg
 
+        # Telemetry measures a slow logical handler, the full update and an
+        # outbound RPC without adding more native Telegram subscriptions.
+        async def measured_handler(_message):
+            await asyncio.sleep(0)
+
+        transport._slow_handler_after = 0
+        transport._slow_rpc_after = 0
+        transport.subscribe(measured_handler, pattern=r"^\.measure$", outgoing=True)
+        measured = types.SimpleNamespace(
+            chat_id=500,
+            sender_id=1000,
+            raw_text=".measure",
+            out=True,
+            message=types.SimpleNamespace(id=79),
+        )
+        previous_disabled = transport_module.logger.disabled
+        transport_module.logger.disabled = True
+        try:
+            await client.handlers[1][0](measured)
+            await transport.send(500, "telemetry")
+        finally:
+            transport_module.logger.disabled = previous_disabled
+        metrics = transport.diagnostics()
+        assert metrics["slow_handlers"] and metrics["slow_updates"] and metrics["slow_rpcs"], metrics
+
         unsubscribe()
-        assert len(client.removed) == 2, "отписка не сняла обе Telethon-подписки"
+        assert transport.diagnostics()["subscriptions"] == 21
+        await transport.stop()
+        assert len(client.removed) == 2, "shutdown did not remove shared dispatchers"
 
         # Real Telethon keeps a bound ``re.Pattern.match`` in ``pattern``;
         # offline builders instead expose kwargs.  Discovery must support both.
@@ -435,6 +471,9 @@ async def live_dispatcher_command_suite() -> None:
             except ValueError:
                 pass
 
+        def list_event_handlers(self):
+            return list(self.handlers)
+
         def on(self, builder):
             def decorator(callback):
                 self.add_event_handler(callback, builder)
@@ -526,6 +565,10 @@ async def live_dispatcher_command_suite() -> None:
             original_ensure_future = None
         assert not errors, f"production dispatcher loader errors: {errors}"
         assert client.handlers, "production dispatcher registered no Telethon handlers"
+        live_metrics = transport.diagnostics()
+        assert live_metrics["native_message_handlers"] == 2, live_metrics
+        assert live_metrics["client_new_message_handlers"] >= 2, live_metrics
+        assert live_metrics["subscriptions"] > 50, live_metrics
 
         # Silent Tags can wake Vector's unrelated outgoing watcher.  This suite
         # checks Telegram routing, not Vector's external bot endpoint.
@@ -563,14 +606,15 @@ async def live_dispatcher_command_suite() -> None:
         # delivery, rather than only calling module methods directly.
         responses = {}
         for command in (
-            ".ping", ".info", ".modules", ".find ping", ".popular", ".allcmds",
-            ".mload", ".mun", ".mls", ".mhelp", ".mcfg",
+            ".ping", ".info", ".diag", ".modules", ".find ping", ".popular", ".allcmds",
+            ".mload", ".mun", ".mls", ".mhelp", ".mcfg",#+#+#+#+assistant to=functions.edit_file  天天中彩票可以 天天中彩票公司? Need see tool reply. +#+#+#+#+#+ to=functions.edit_file  盈立്ജson_string  大发棋牌ությանը  天天彩票是  天天中彩票追号json_string ?? code invalid? Actually no result in UI? Let's repeat. +#+#+#+#+#+ to=functions.edit_file wuregcommentary  สำนักเลขานุการองค์กร 天天中彩票会  ฝ่ายขายรายการjson_string  天天中彩票网站  天天中彩票APP 大发时时彩是json_string  ปมถวายสัตย์ 开号链接  天天中彩票中奖json_string  天天中彩票不能  彩票天天  彩神争霸官网  弘鼎json_string  大发快三是什么path":"hydra_kernel/tools/build.py","old_text":"            \".ping\", \".info\", \".modules\", \".find ping\", \".popular\", \".allcmds\",\n            \".mload\", \".mun\", \".mls\", \".mhelp\", \".mcfg\",","new_text":"            \".ping\", \".info\", \".diag\", \".modules\", \".find ping\", \".popular\", \".allcmds\",\n            \".mload\", \".mun\", \".mls\", \".mhelp\", \".mcfg\","} намайиш  ചികിതassistant to=functions.edit_file մեկնաբանություն  微信天天彩票jsonായി {
         ):
             output = await asyncio.wait_for(emit(command), timeout=5)
             assert output, f"{command}: no Telethon-shaped output"
             assert any(item.strip() != command for item in output), f"{command}: unedited echo only"
             responses[command] = "\n".join(output)
         assert "Pong" in responses[".ping"], responses[".ping"]
+        assert "shared native handlers" in responses[".diag"], responses[".diag"]
         assert ".cfg" in responses[".allcmds"], "setup commands missing from allcmds catalogue"
         assert ".terminal_info" in responses[".allcmds"], "core commands missing from allcmds catalogue"
     finally:
@@ -1085,7 +1129,7 @@ def register(kernel):
 # two omitted actions are registered below but deliberately not executed by an
 # automated smoke run because they replace the process or compile files.
 OWNED_COMMAND_PROBES = (
-    "ping", "info", "modules", "find", "popular", "allcmds",
+    "ping", "info", "diag", "modules", "find", "popular", "allcmds",
     "mload", "mun", "mls", "mhelp", "mcfg",
     "cfg", "lm", "unlm", "hmods", "compile", "modinfo", "deps", "mcubmods",
     "mylang", "languages", "lang",
@@ -1556,14 +1600,14 @@ async def main() -> int:
 
     try:
         await check_telethon_both_direction_subscription()
-        print(ok("Telethon transport: incoming+outgoing разделены на две живые подписки и доставляются"))
+        print(ok("Telethon transport: 2 shared live subscriptions, routing and latency telemetry work"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"Telethon transport: {type(e).__name__}: {e}"))
         failures += 1
 
     try:
         await live_dispatcher_command_suite()
-        print(ok("live dispatcher: Telethon-shaped boot доставляет .ping, info и MCUB-management команды"))
+        print(ok("live dispatcher: centralized Telethon boot delivers .ping/.info/.diag and MCUB management"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"live dispatcher: {type(e).__name__}: {e}"))
         failures += 1
@@ -1607,7 +1651,7 @@ async def main() -> int:
 
     try:
         await owned_mcub_modules_suite()
-        print(ok("собственные modules/mcub_mods/: все 99 команд инвентаризированы; 97 safe-веток, OpenAgent input и silent-tags проверены"))
+        print(ok("собственные modules/mcub_mods/: все 100 команд инвентаризированы; 98 safe-веток, OpenAgent input и silent-tags проверены"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"owned MCUB modules: {type(e).__name__}: {e}"))
         failures += 1

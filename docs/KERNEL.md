@@ -22,6 +22,10 @@ L0  hydra_kernel/kernel transport · db · runtime/logging/loop
     `inject_callback()`, очередь `sent`, `deleted`, `inline_answers`,
     `callback_answers`. Позволяет ядру **собираться и проходить smoke без сети**.
   - `TelethonTransport` — боевой (опционален: без telethon пакет импортируется).
+    Он держит две shared native-подписки `NewMessage` (incoming/outgoing) и
+    маршрутизирует logical command/watcher-подписки внутри ядра, чтобы не
+    создавать native callback на каждую команду. `diagnostics()` выдаёт
+    secret-free счётчики задержек/ошибок для `.diag`.
   - `Message` — нормализованное сообщение: `reply/edit/delete`, telethon-алиасы
     `message/raw_text/out`.
 - **DB** — `MemoryDB` / `JsonDB`: async key-value с пространствами имён.
@@ -96,7 +100,7 @@ heroku-rich / dragon`.
 Отдельный production-аудит запускает именно путь `modules/mcub.py`: он строит
 инвентарь всех команд, загруженных этим диспетчером из `modules/` и
 `modules/mcub_mods/`, и падает, если новая команда не получила сценарий. В
-текущем наборе это 88 команд: 86
+текущем наборе это 100 команд: 98
 безопасных usage/menu/UI-веток вызываются, а `.compileall` (пишет/компилирует
 файлы) и `.restart` (заменяет процесс) регистрируются, но явно
 классифицируются как неисполняемые в автоматическом прогоне. Терминал,
@@ -105,8 +109,9 @@ heroku-rich / dragon`.
 классификации.
 
 Проверка живой доставки команд Telethon использует API-двойник и отдельно
-проверяет две подписки `incoming`/`outgoing` (Telethon не допускает их в одном
-`NewMessage`). Фактический Telegram-сеанс и авторизация Vector-бота требуют
+проверяет две shared-подписки `incoming`/`outgoing` (Telethon не допускает их
+в одном `NewMessage`), logical fan-out, cleanup и latency telemetry.
+Фактический Telegram-сеанс и авторизация Vector-бота требуют
 настроенных в окружении учётных данных/токена и должны проверяться отдельно
 на боевом аккаунте. Выход 0 означает, что все офлайн-цели зелёные.
 

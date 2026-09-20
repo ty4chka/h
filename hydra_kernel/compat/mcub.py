@@ -473,16 +473,16 @@ class KernelRegister:
                             await self._call_loop(fn)
                         except asyncio.CancelledError:
                             raise
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error("loop %s failed: %s", getattr(fn, "__name__", "?"), exc)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("loop %s failed", getattr(fn, "__name__", "?"))
                     await asyncio.sleep(max(float(interval), 0.01))
                     if wait_before:
                         try:
                             await self._call_loop(fn)
                         except asyncio.CancelledError:
                             raise
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error("loop %s failed: %s", getattr(fn, "__name__", "?"), exc)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("loop %s failed", getattr(fn, "__name__", "?"))
 
             handle = LoopHandle(runner, autostart)
             self._iface._track_cleanup(handle.stop)
@@ -704,8 +704,9 @@ class McubKernelInterface:
                     if inspect.isawaitable(result):
                         await result
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("mcub command %s failed: %s", _cmd, exc)
-                    await self.handle_error(exc, event=event)
+                    await self.handle_error(
+                        exc, event=event, source=f"mcub command {_cmd} failed"
+                    )
 
             unsubscribe = self.h.transport.subscribe(
                 wrapper, pattern=pattern, incoming=True, outgoing=True
@@ -754,8 +755,8 @@ class McubKernelInterface:
                 result = handler(event)
                 if inspect.isawaitable(result):
                     await result
-            except Exception as exc:  # noqa: BLE001
-                logger.error("mcub watcher failed: %s", exc)
+            except Exception:  # noqa: BLE001
+                logger.exception("mcub watcher failed")
 
         options = {k: v for k, v in kw.items() if k in {"pattern", "incoming", "outgoing", "chats"}}
         self._track_cleanup(self.h.transport.subscribe(wrapper, **options))
@@ -1057,7 +1058,12 @@ class McubKernelInterface:
     async def handle_error(self, exc: Exception, *args: Any, **kw: Any) -> None:
         message = kw.get("message") or kw.get("source") or "Module error"
         event = kw.get("event")
-        self.logger.error("%s: %s", message, exc)
+        self.logger.error(
+            "%s: %s",
+            message,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         if event is not None and hasattr(event, "reply"):
             try:
                 await event.reply(f"<b>Error:</b> <code>{str(exc)[:200]}</code>")
