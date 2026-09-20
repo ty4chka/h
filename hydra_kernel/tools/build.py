@@ -611,7 +611,7 @@ async def live_dispatcher_command_suite() -> None:
         responses = {}
         for command in (
             ".ping", ".info", ".diag", ".modules", ".find ping", ".popular", ".allcmds",
-            ".mload", ".mun", ".mls", ".mhelp", ".mcfg",#+#+#+#+assistant to=functions.edit_file  天天中彩票可以 天天中彩票公司? Need see tool reply. +#+#+#+#+#+ to=functions.edit_file  盈立്ജson_string  大发棋牌ությանը  天天彩票是  天天中彩票追号json_string ?? code invalid? Actually no result in UI? Let's repeat. +#+#+#+#+#+ to=functions.edit_file wuregcommentary  สำนักเลขานุการองค์กร 天天中彩票会  ฝ่ายขายรายการjson_string  天天中彩票网站  天天中彩票APP 大发时时彩是json_string  ปมถวายสัตย์ 开号链接  天天中彩票中奖json_string  天天中彩票不能  彩票天天  彩神争霸官网  弘鼎json_string  大发快三是什么path":"hydra_kernel/tools/build.py","old_text":"            \".ping\", \".info\", \".modules\", \".find ping\", \".popular\", \".allcmds\",\n            \".mload\", \".mun\", \".mls\", \".mhelp\", \".mcfg\",","new_text":"            \".ping\", \".info\", \".diag\", \".modules\", \".find ping\", \".popular\", \".allcmds\",\n            \".mload\", \".mun\", \".mls\", \".mhelp\", \".mcfg\","} намайиш  ചികിതassistant to=functions.edit_file մեկնաբանություն  微信天天彩票jsonായി {
+            ".mload", ".mun", ".mls", ".mhelp", ".mcfg",
         ):
             output = await asyncio.wait_for(emit(command), timeout=5)
             assert output, f"{command}: no Telethon-shaped output"
@@ -932,6 +932,64 @@ async def real_mcub_module() -> None:
     await h.stop()
 
 
+# CubKit-подобный модуль (так собирают Vector/OpenAgent): относительные импорты
+# в самый ранний момент, с маркером бутстрапа и без него.
+RELATIVE_IMPORT_FIXTURE = '''# meta: name=relpkg_fixture version=1.0.0 framework=mcub
+from core.lib.loader.module_base import ModuleBase, command
+from .Const import LOADING_BANNER, _esc
+
+
+class RelpkgFixture(ModuleBase):
+    name = "relpkg_fixture"
+    version = "1.0.0"
+
+    @command("relpkg")
+    async def cmd_relpkg(self, event):
+        await event.edit(f"relative import ok: {_esc(LOADING_BANNER)}")
+'''
+
+
+async def relative_import_module_suite() -> None:
+    """MCUB-модуль с `from .Const import ...` грузится через `.mload`.
+
+    Регресс Termux-лога: CubKit-сборка Vector падала на
+    «ModuleNotFoundError: No module named 'vector'» — Hydra выполняла исходник
+    в безымянном namespace, а относительный импорт требует module-объект в
+    sys.modules (в MCUB-fork загрузчик регистрирует его до exec).
+    """
+
+    import tempfile
+    from pathlib import Path
+
+    h = Hydra(owner_id=1000)
+    await h.start()
+    with tempfile.TemporaryDirectory() as tmp:
+        bundle = Path(tmp)
+        (bundle / "Const.py").write_text(
+            'LOADING_BANNER = "banner-ok"\n\n\ndef _esc(text):\n    return text\n',
+            encoding="utf-8",
+        )
+        module_file = bundle / "relpkg_fixture.py"
+        module_file.write_text(RELATIVE_IMPORT_FIXTURE, encoding="utf-8")
+
+        record = await h.loader.load_source(
+            "relpkg_fixture",
+            RELATIVE_IMPORT_FIXTURE,
+            framework="mcub",
+            file_path=str(module_file),
+        )
+        assert record.name == "relpkg_fixture", record.name
+        assert record.module is not None
+
+        await h.transport.inject(500, ".relpkg", sender_id=1000, outgoing=True)
+        assert "relative import ok: banner-ok" in h.transport.sent[-1].text, \
+            h.transport.sent[-1].text
+
+        # `.mun` выгружает модуль и его запись в sys.modules не остаётся мусором
+        await h.loader.unload("relpkg_fixture")
+    await h.stop()
+
+
 async def real_hikka_dragon() -> None:
     """Фаза 3: настоящие модули Hikka (hikkatl) и Dragon (pyrogram)."""
     h = Hydra(owner_id=1000)
@@ -1141,6 +1199,41 @@ def register(kernel):
             assert h.transport.sent[-1].text == "audit URL install works"
             await h.transport.inject(500, ".mun audit_url_install --del", sender_id=1000, outgoing=True)
             assert h.registry.get("audit_url_install") is None
+
+            # CubKit-style sources (Vector/OpenAgent) import helpers by relative
+            # path: `from .Const import ...`. In the URL flow the module file is
+            # written *after* exec, so the loader must publish a module object
+            # in sys.modules with its own __path__ before running the source.
+            # Before this, `.mload <url>` died with
+            # «ModuleNotFoundError: No module named '<module>'».
+            Path(temp_dir, "Const.py").write_text(
+                'LOADING_BANNER = "banner-ok"\n', encoding="utf-8"
+            )
+            cubkit_source = '''# meta: name=audit_cubkit version=1.0.0 framework=mcub
+from core.lib.loader.module_base import ModuleBase, command
+from .Const import LOADING_BANNER
+
+
+class AuditCubkit(ModuleBase):
+    name = "audit_cubkit"
+
+    @command("auditcubkit")
+    async def cmd_cubkit(self, event):
+        await event.edit(f"cubkit relative import: {LOADING_BANNER}")
+'''
+            control._download_source = lambda _url: cubkit_source
+            try:
+                installed, detail = await iface.install_from_url(
+                    "https://example.invalid/audit_cubkit.py", "audit_cubkit"
+                )
+            finally:
+                delattr(control, "_download_source")
+            assert installed, detail
+            await h.transport.inject(500, ".auditcubkit", sender_id=1000, outgoing=True)
+            assert "cubkit relative import: banner-ok" in h.transport.sent[-1].text, \
+                h.transport.sent[-1].text
+            await h.transport.inject(500, ".mun audit_cubkit --del", sender_id=1000, outgoing=True)
+            assert h.registry.get("audit_cubkit") is None
 
         # The command catalogue comes from all adapters, not only lifecycle
         # modules, so discovery reflects what production can actually route.
@@ -1410,7 +1503,12 @@ async def owned_mcub_modules_suite() -> None:
             await h.transport.inject(
                 500, f".cb 1 {api_menu_no}", sender_id=1000, outgoing=True
             )
-            assert "API protection" in api_form.text, "API protection callback did not edit its form"
+            # Текст может быть локализован (mcub langpacks: «Зaщитa API»),
+            # поэтому проверяем сам факт перерисовки формы, а не только
+            # англоязычный дефолт из FALLBACK_LANG модуля.
+            assert api_form.text.strip() and (
+                "API" in api_form.text or "\u0417a\u0449\u0438\u0442a" in api_form.text
+            ), f"API protection callback did not edit its form: {api_form.text[:120]}"
 
             # A tagged incoming message exercises normalized Message.mentioned,
             # get_chat/get_sender, is_private and the `me` ClientProxy alias.
@@ -1695,6 +1793,27 @@ async def main() -> int:
         print(ok("real Heroku modules/translations.py: пакетные импорты, форма, кнопка, .setlang en"))
     except Exception as e:  # noqa: BLE001
         print(fail(f"real heroku translations: {type(e).__name__}: {e}"))
+        failures += 1
+
+    # Языковые паки проверяются отдельным процессом: в нём реальный
+    # utils.strings импортируется раньше ядра — ровно как в боевом m.py.
+    r = subprocess.run(
+        [sys.executable, "tools/langpacks_check.py"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if r.returncode == 0:
+        print(ok("MCUB langpacks: реальный utils.strings + core.langpacks, modules/protect.py грузится"))
+    else:
+        print(fail(f"MCUB langpacks: {(r.stdout + r.stderr).strip()[-300:]}"))
+        failures += 1
+
+    try:
+        await relative_import_module_suite()
+        print(ok("MCUB относительные импорты (CubKit-стиль): модуль грузится и отвечает"))
+    except Exception as e:  # noqa: BLE001
+        print(fail(f"MCUB относительные импорты: {type(e).__name__}: {e}"))
         failures += 1
 
     try:

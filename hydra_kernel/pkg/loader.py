@@ -87,7 +87,11 @@ class Loader:
             module, lifecycle = await self._load_hydra(name, source, file_path)
         else:
             adapter = self.adapter_for(fw)
-            module, lifecycle = await adapter.load_source(name, source)
+            # file_path нужен MCUB-адаптеру: по нему строится spec модуля и
+            # __path__ для относительных импортов (CubKit-сборки).
+            module, lifecycle = await adapter.load_source(
+                name, source, file_path=file_path
+            )
 
         record = Record(
             name=manifest.name, module=module, manifest=manifest, framework=fw, lifecycle=lifecycle

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import re
 import sys
 import types
 from typing import Any, Dict, List, Optional, Tuple
@@ -272,9 +274,19 @@ class CompatAdapter:
 
     framework = "base"
 
+    # Относительные импорты (`from .Const import ...`) и CubKit-сборки
+    # (github.com/hairpin01/CubKit) требуют, чтобы исходник выполнялся в
+    # настоящем module-объекте, зарегистрированном в sys.modules под своим
+    # именем: иначе `from .X import Y` падает с
+    # «ModuleNotFoundError: No module named '<name>'». В MCUB-fork загрузчик
+    # делает ровно это (core/lib/mixin/module_loader_mixin.py:934).
+    _PACKAGE_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+\.", re.M)
+    _CUBKIT_MARKER = "__cubkit_bootstrap__"
+
     def __init__(self, hydra: Any):
         self.h = hydra
         self._mods: List[str] = []
+        self._owned_modules: Dict[str, types.ModuleType] = {}
 
     def _put_module(self, dotted: str) -> types.ModuleType:
         mod = types.ModuleType(dotted)
@@ -293,19 +305,115 @@ class CompatAdapter:
         for dotted in self._mods:
             sys.modules.pop(dotted, None)
         self._mods.clear()
+        for module_name, module in list(self._owned_modules.items()):
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+        self._owned_modules.clear()
 
-    def exec_source(self, name: str, source: str, package: Optional[str] = None) -> Dict[str, Any]:
+    def _needs_package(self, source: str) -> bool:
+        """Нужен ли исходнику собственный пакет в sys.modules."""
+
+        return bool(self._PACKAGE_IMPORT_RE.search(source)) or self._CUBKIT_MARKER in source
+
+    def _ensure_module(
+        self, name: str, file_path: Optional[str] = None
+    ) -> types.ModuleType:
+        """Создать (или переиспользовать свой) module-объект для sys.modules.
+
+        Имя модуля сохраняется, если оно свободно: так относительные импорты
+        CubKit видят ровно тот пакет, который называет сам модуль
+        (``module_globals["__package__"] = module_globals.get("__name__")``).
+        Если имя занято чужим модулем (например `config` из корня репозитория),
+        берётся свободный алиас — относительные импорты внутри модуля работают
+        так же.
+        """
+
+        from pathlib import Path as _P
+
+        # Абсолютный путь обязателен: относительный элемент __path__ не
+        # резолвится импорт-машиной (`No module named '<name>.Const'`), а
+        # .mload передаёт именно относительный `modules/<name>.py`.
+        path = _P(file_path) if file_path else _P("modules") / f"{name}.py"
+        try:
+            path = path.resolve()
+        except OSError:  # pragma: no cover - неразрешимый путь остаётся как есть
+            pass
+        module_name = name
+        existing = sys.modules.get(module_name)
+        owned = self._owned_modules.get(module_name)
+        if existing is not None and existing is not owned:
+            module_name = f"{name}__{self.framework}"
+            existing = sys.modules.get(module_name)
+            owned = self._owned_modules.get(module_name)
+            if existing is not None and existing is not owned:
+                module_name = f"{name}__{self.framework}_{id(self):x}"
+
+        spec = None
+        if path.suffix == ".py":
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, str(path), submodule_search_locations=[str(path.parent)]
+                )
+            except Exception:  # noqa: BLE001 - алиас всё равно должен работать
+                spec = None
+        if spec is None:
+            module = types.ModuleType(module_name)
+            module.__path__ = [str(path.parent)]
+        else:
+            module = importlib.util.module_from_spec(spec)
+        module.__name__ = module_name
+        # Модуль публикует себя как пакет: `from .X import Y` резолвится через
+        # его же __path__ (соседние файлы), а CubKit переопределяет __path__/
+        # __spec__.submodule_search_locations своими распакованными каталогами.
+        module.__package__ = module_name
+        module.__file__ = str(path)
+        sys.modules[module_name] = module
+        self._owned_modules[module_name] = module
+        return module
+
+    def exec_source(
+        self,
+        name: str,
+        source: str,
+        package: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ns, _effective_name = self.exec_module_source(name, source, package, file_path)
+        return ns
+
+    def exec_module_source(
+        self,
+        name: str,
+        source: str,
+        package: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], str]:
+        """Выполнить исходник. Возвращает (namespace, имя модуля в sys.modules)."""
+
         code = compile(source, f"<{self.framework}:{name}>", "exec")
+        if package is None and self._needs_package(source):
+            module = self._ensure_module(name, file_path)
+            try:
+                exec(code, module.__dict__)  # noqa: S102 — исходник уже просканирован L3
+            except BaseException:
+                if sys.modules.get(module.__name__) is module:
+                    sys.modules.pop(module.__name__, None)
+                self._owned_modules.pop(module.__name__, None)
+                raise
+            return module.__dict__, module.__name__
+
         ns: Dict[str, Any] = {"__name__": name}
         # __file__ ждут некоторые MCUB-модули (loader.py)
         from pathlib import Path as _P
 
-        real = _P("modules") / f"{name}.py"
+        real = _P(file_path) if file_path else _P("modules") / f"{name}.py"
         ns["__file__"] = str(real) if real.exists() else f"<{self.framework}:{name}>.py"
         if package:
             ns["__package__"] = package  # для `from .. import loader` у Heroku
         exec(code, ns)  # noqa: S102 — исходник уже просканирован L3
-        return ns
+        return ns, name
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         raise NotImplementedError

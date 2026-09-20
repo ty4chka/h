@@ -14,7 +14,7 @@ import asyncio
 import importlib
 import logging
 import re
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger("hydra_kernel.compat.core")
 
@@ -159,7 +159,9 @@ class NoopAdapter:
     def install(self) -> None:  # pragma: no cover - тривиально
         pass
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         mod = _import_module(name)
         return mod, None
 
@@ -173,7 +175,9 @@ class SetupAdapter:
     def install(self) -> None:  # pragma: no cover - тривиально
         pass
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         mod = _import_module(name)
         setup = getattr(mod, "setup", None)
         if setup is None:
@@ -208,7 +212,9 @@ class CoreStyleAdapter:
     def install(self) -> None:  # pragma: no cover - тривиально
         pass
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         mod = _import_module(name)
         prefix = re.escape(self.h.prefix)
         count = 0

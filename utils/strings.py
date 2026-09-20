@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import logging
 import weakref
 from typing import Any
 
 __all__ = ["Strings", "get_available_locales", "reload_packs"]
+
+logger = logging.getLogger("utils.strings")
 
 _FALLBACK = "en"
 _GROUP_VALUE = "__value__"
@@ -181,7 +184,7 @@ class Strings:
         fallback: str = _FALLBACK,
         strict: bool = False,
     ) -> None:
-        if not data:
+        if not data and strict:
             raise ValueError("Strings: data dict must not be empty")
 
         self._fallback = fallback
@@ -215,10 +218,27 @@ class Strings:
                     active = v
                     break
         if not active:
-            raise ValueError(
-                f"Strings: no valid locale data found. "
-                f"Requested: {self._locale}, fallback: {fallback}, available: {list(self._data.keys())}"
+            # MCUB-fork кидает ValueError. В Hydra модуль с отсутствующим
+            # языковым паком (или без единого пака на диске) должен грузиться:
+            # строки берутся как есть из inline-данных, а незаполненные ключи
+            # отдаёт _MissingKey / get(default). Жёсткий режим — только strict.
+            if self._strict:
+                raise ValueError(
+                    f"Strings: no valid locale data found. "
+                    f"Requested: {self._locale}, fallback: {fallback}, "
+                    f"available: {list(self._data.keys())}"
+                )
+            module_label = f" for module {self._module_name!r}" if self._module_name else ""
+            logger.warning(
+                "Strings%s: no locale data found (requested: %s, fallback: %s, "
+                "available: %s) — остаются inline-строки и get(default)",
+                module_label,
+                self._locale,
+                fallback,
+                list(self._data.keys()),
             )
+            self._data.setdefault(self._locale, {})
+            active = self._data[self._locale]
         self._active: dict[str, Any] = active
 
     def _load_from_langpacks(

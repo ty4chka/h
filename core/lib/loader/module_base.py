@@ -235,6 +235,17 @@ class Strings:
             loc = pack.get(self.locale) or pack.get('ru') or {}
             for k, v in loc.items():
                 merged.setdefault(k, v)
+        # Паки MCUB-fork (core.langpacks) идут поверх встроенных: там лежат
+        # строки модуля и общие группы (кнопки, ошибки), как в utils.strings.
+        if mod:
+            try:
+                from core.langpacks import get_module_strings
+
+                pack_strings = get_module_strings(str(mod), self.locale)
+            except Exception:  # noqa: BLE001 - паки опциональны
+                pack_strings = {}
+            if isinstance(pack_strings, dict):
+                merged.update(pack_strings)
         # ``tools/build_native.py`` may leave an older compiled api.lang
         # extension in place until the end of a build.  Real MCUB UpdatesMod
         # invokes this nested group during startup, so retain the essential

@@ -412,7 +412,9 @@ class HikkaLikeAdapter(CompatAdapter):
             reload_translations=reload_translations,
         )
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         dotted = f"{self.pkg}.modules.{name}"
         ns = self.exec_source(dotted, source, package=f"{self.pkg}.modules")
         cls = None
@@ -533,10 +535,12 @@ class DragonAdapter(HikkaLikeAdapter):
             except ImportError:
                 self._put_module("utils.db")
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         self._pg_client.registry.clear()
         try:
-            return await super().load_source(name, source)
+            return await super().load_source(name, source, file_path=file_path)
         except ValueError:
             pass
         entries = list(self._pg_client.registry)

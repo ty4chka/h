@@ -2094,7 +2094,13 @@ class McubAdapter(CompatAdapter):
         self._install_telethon_shim()
 
     def _install_utils_strings(self) -> None:
-        """utils.strings как в MCUB: Strings, get_available_locales, reload_packs."""
+        """utils.strings как в MCUB: реальная реализация MCUB-fork, иначе shim.
+
+        Настоящий ``utils/strings.py`` (порт MCUB-fork) читает паки через
+        ``core.langpacks`` и понимает ``{"name": ...}``-форму, поэтому он и
+        предпочитается. Shim нужен только там, где пакет ``utils`` недоступен
+        (или его импорт сломан): тогда модули получают Strings ядра Hydra.
+        """
         import sys
 
         from ..api.lang import Strings, get_available_locales, reload_packs
@@ -2104,10 +2110,15 @@ class McubAdapter(CompatAdapter):
         # не топчем настоящий пакет utils: shim только если его нет
         import importlib
 
+        strings_mod = None
         try:
             utils_mod = importlib.import_module("utils")
+            strings_mod = importlib.import_module("utils.strings")
         except ImportError:
             utils_mod = self._put_module("utils")
+        if strings_mod is not None and getattr(strings_mod, "__file__", None):
+            utils_mod.strings = strings_mod
+            return
         strings_mod = self._put_module("utils.strings")
         for key, value in {
             "Strings": Strings,
@@ -2162,11 +2173,16 @@ class McubAdapter(CompatAdapter):
 
         ensure_offline_dependencies()
 
-    async def load_source(self, name: str, source: str) -> Tuple[Any, Any]:
+    async def load_source(
+        self, name: str, source: str, file_path: Optional[str] = None
+    ) -> Tuple[Any, Any]:
         iface = self.iface
         scope = iface.begin_registration_scope(name)
         try:
-            ns = self.exec_source(name, source)
+            # Относительные импорты (CubKit-сборки вида Vector/OpenAgent)
+            # выполняются в настоящем модуле из sys.modules — тогда
+            # `from .Const import ...` резолвится, как в MCUB-fork.
+            ns, module_name = self.exec_module_source(name, source, file_path=file_path)
             iface.set_module_exports(name, ns)
 
             if callable(ns.get("register")):
@@ -2188,7 +2204,7 @@ class McubAdapter(CompatAdapter):
                     isinstance(value, type)
                     and value is not ModuleBase
                     and value is not McubModuleBase
-                    and getattr(value, "__module__", "") == name
+                    and getattr(value, "__module__", "") in (name, module_name)
                     and (
                         issubclass(value, ModuleBase)
                         or hasattr(value, "_cmd_registry")  # настоящий core-style
