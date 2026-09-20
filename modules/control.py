@@ -252,24 +252,32 @@ class Control(ModuleBase):
                 return record
         return None
 
-    def _stored_paths(self, record, requested_name: str = "") -> set[Path]:
-        """Possible persisted source paths for a loaded MCUB record.
+    def _stored_paths(self, record=None, requested_name: str = "") -> set[Path]:
+        """Possible persisted source paths for loaded or skipped MCUB modules.
 
         A ``# meta: name=...`` may intentionally differ from the downloaded
-        filename, so record.name alone is not enough for ``.mls``/``.mun``.
+        filename.  Duplicate source files are intentionally skipped at boot,
+        so ``.mun name --del`` must also find a file that has no registry
+        record.  Scan case-insensitively to handle historical ``Vector.py``
+        versus ``vector.py`` names on Termux filesystems.
         """
 
-        names = {
-            record.name,
-            requested_name,
-            str(getattr(record.module, "name", "")),
-            str(getattr(type(record.module), "__module__", "")),
-        }
-        return {
-            self.modules_dir / f"{_safe_module_name(name, 'module')}.py"
-            for name in names
-            if name
-        }
+        names = {requested_name}
+        if record is not None:
+            names.update(
+                {
+                    record.name,
+                    str(getattr(record.module, "name", "")),
+                    str(getattr(type(record.module), "__module__", "")),
+                }
+            )
+        stems = {_safe_module_name(name, "module") for name in names if name}
+        paths = {self.modules_dir / f"{stem}.py" for stem in stems}
+        if self.modules_dir.is_dir():
+            for target in self.modules_dir.glob("*.py"):
+                if target.stem.lower() in stems:
+                    paths.add(target)
+        return paths
 
     def _mcub_commands(self, record) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
         iface = self._mcub_interface()
@@ -462,7 +470,26 @@ class Control(ModuleBase):
         remove_file = "--del" in tokens
         record = self._record_for(name, mcub_only=True)
         if record is None:
-            await event.edit(f"❌ MCUB-модуль <code>{_escape(name)}</code> не найден")
+            # A byte-identical persisted module is skipped on boot to prevent
+            # duplicate commands, but it must still be removable.  Previously
+            # `.mload` told users to run this exact command and `.mun` then
+            # refused because no registry record existed.
+            if remove_file:
+                for target in self._stored_paths(None, name):
+                    try:
+                        if target.is_file() and target.parent.resolve() == self.modules_dir.resolve():
+                            target.unlink()
+                            await event.edit(
+                                "<b>✅ Удалён сохранённый, но незагруженный MCUB-файл:</b> "
+                                f"<code>{_escape(target.name)}</code>"
+                            )
+                            return
+                    except OSError:
+                        pass
+            await event.edit(
+                f"❌ MCUB-модуль <code>{_escape(name)}</code> не найден"
+                + (" и сохранённый файл не найден" if remove_file else "")
+            )
             return
         if not await self.kernel.loader.unload(record.name):
             await event.edit(f"❌ Не удалось выгрузить <code>{_escape(record.name)}</code>")

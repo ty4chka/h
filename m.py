@@ -624,6 +624,16 @@ logger.info(
     sys.executable,
     LOG_FILE,
 )
+try:
+    _free_bytes = shutil.disk_usage(PROJECT_ROOT).free
+    if _free_bytes < 256 * 1024 * 1024:
+        logger.error(
+            "critically low disk space: %.1f MiB free under %s; SQLite/logs/cache can stall",
+            _free_bytes / (1024 * 1024),
+            PROJECT_ROOT,
+        )
+except OSError:
+    pass
 
 start_time = time.time()
 set_start_time(start_time)

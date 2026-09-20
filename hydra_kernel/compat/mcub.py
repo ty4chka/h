@@ -750,14 +750,22 @@ class McubKernelInterface:
                 self._track_cleanup(cleanup_primary)
 
     def register_watcher(self, handler: Callable, **kw: Any) -> None:
+        original = getattr(handler, "__original__", handler)
+        instance = getattr(handler, "__bound_instance__", None) or getattr(handler, "__self__", None)
+        owner = getattr(instance, "name", None) or getattr(original, "__module__", "mcub")
+        handler_name = getattr(original, "__name__", getattr(handler, "__name__", "watcher"))
+
         async def wrapper(event: Any) -> None:
             try:
                 result = handler(event)
                 if inspect.isawaitable(result):
                     await result
             except Exception:  # noqa: BLE001
-                logger.exception("mcub watcher failed")
+                logger.exception("mcub watcher %s.%s failed", owner, handler_name)
 
+        # Transport telemetry uses __qualname__; retain the actual module and
+        # watcher name instead of the opaque register_watcher.<locals>.wrapper.
+        wrapper.__qualname__ = f"MCUB.{owner}.{handler_name}"
         options = {k: v for k, v in kw.items() if k in {"pattern", "incoming", "outgoing", "chats"}}
         self._track_cleanup(self.h.transport.subscribe(wrapper, **options))
 
@@ -1091,8 +1099,31 @@ class McubKernelInterface:
     def log_debug(self, *args: Any, **kw: Any) -> None:
         self.logger.debug(*args, **kw)
 
-    async def install_from_url(self, url: str) -> Tuple[bool, str]:
-        return False, "Используйте загрузчик Hydra для установки модулей"
+    async def install_from_url(
+        self, url: str, module_name: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Install a legacy MCUB URL through Hydra's checked control loader.
+
+        Several class-style MCUB modules, including Vector, pass a suggested
+        module name as a second positional argument.  The former one-argument
+        stub raised TypeError before the safe Hydra scanner/loader could even
+        reject or install the source.
+        """
+
+        record = self.h.registry.get("control")
+        control = getattr(record, "module", None) if record is not None else None
+        download = getattr(control, "_download_source", None)
+        install = getattr(control, "_install_mcub_source", None)
+        if not callable(download) or not callable(install):
+            return False, "Модуль control не загружен; используйте .mload <URL>"
+        try:
+            source = await asyncio.to_thread(download, url)
+            suggested_name = module_name or Path(url.split("?", 1)[0]).stem or "mcub_url"
+            loaded, _path = await install(suggested_name, source)
+            return True, f"Загружен: {getattr(loaded, 'name', suggested_name)}"
+        except Exception as exc:  # noqa: BLE001 - return legacy-compatible result
+            logger.exception("MCUB URL installation failed")
+            return False, str(exc)[:300]
 
 
 class McubAdapter(CompatAdapter):

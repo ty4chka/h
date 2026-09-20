@@ -455,6 +455,13 @@ class Vector(ModuleBase):
     btid: int = 0
     httpc: int = 0
 
+    # The install-payload watcher sees every incoming update.  Resolving the
+    # Vector bot through the public API inside that watcher made an unavailable
+    # API stall unrelated chats for seconds at a time.  Keep resolution lazy,
+    # single-flight and rate-limited instead.
+    _btid_task: asyncio.Task | None = None
+    _btid_retry_at: float = 0.0
+
     async def on_load(self) -> None:
         LOG.info("Vector loaded")
         self._http_lock = asyncio.Lock()
@@ -480,8 +487,46 @@ class Vector(ModuleBase):
 
     async def on_unload(self) -> None:
         LOG.info("Vector unloading")
+        task = getattr(self, "_btid_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         if self._http and not self._http.closed:
             await self._http.close()
+
+    def _schedule_bot_id_resolution(self) -> None:
+        """Resolve the Vector bot once without blocking an incoming update."""
+
+        task = getattr(self, "_btid_task", None)
+        if self.btid > 0 or (task is not None and not task.done()):
+            return
+        if time.monotonic() < getattr(self, "_btid_retry_at", 0.0):
+            return
+        self._btid_task = asyncio.create_task(self._resolve_bot_id())
+
+    async def _resolve_bot_id(self) -> None:
+        try:
+            # An API outage must not turn a background identity lookup into a
+            # long-lived task.  _net_req itself has a generous command timeout.
+            binfo = await asyncio.wait_for(self._net_req("GET", "/api/tg-bot"), timeout=5)
+            buname = str((binfo or {}).get("username", "")).strip().lstrip("@")
+            if not buname:
+                self._btid_retry_at = time.monotonic() + 300
+                return
+            entity = await asyncio.wait_for(self.client.get_entity(buname), timeout=5)
+            bot_id = int(getattr(entity, "id", 0) or 0)
+            if bot_id > 0:
+                self.btid = bot_id
+                self._btid_retry_at = 0.0
+                LOG.info("Vector payload bot resolved")
+            else:
+                self._btid_retry_at = time.monotonic() + 300
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retry later, never on every update
+            self._btid_retry_at = time.monotonic() + 300
+            LOG.debug("Vector payload bot lookup deferred: %r", exc)
+        finally:
+            self._btid_task = None
 
     async def _ensure_http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -1597,24 +1642,20 @@ class Vector(ModuleBase):
     async def vector_install_payload_watcher(
         self, event: events.NewMessage.Event
     ) -> None:
-        if event.out:
+        if event.out or not self.config["VectorInstall"]:
             return
-        if not self.config["VectorInstall"]:
+        # Most incoming messages cannot be Vector service payloads.  Reject
+        # them before any HTTP/entity lookup; this watcher otherwise ran an
+        # external request for every ordinary chat message while btid was 0.
+        text = (event.text or "").strip()
+        if text != LANG_PING and not text.startswith("#v_payload:"):
             return
-        if not self.btid:
-            try:
-                binfo = await self._net_req("GET", "/api/tg-bot")
-                buname = (binfo or {}).get("username", "").strip().lstrip("@")
-                if buname:
-                    self.btid = getattr(await self.client.get_entity(buname), "id", 0)
-            except Exception:
-                self.btid = -1
         if self.btid <= 0:
+            self._schedule_bot_id_resolution()
             return
         sid = getattr(event, "sender_id", None) or 0
         if sid and int(sid) != self.btid:
             return
-        text = (event.text or "").strip()
         if text == LANG_PING:
             with suppress(Exception):
                 await self.client.send_message(

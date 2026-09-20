@@ -569,6 +569,10 @@ async def live_dispatcher_command_suite() -> None:
         assert live_metrics["native_message_handlers"] == 2, live_metrics
         assert live_metrics["client_new_message_handlers"] >= 2, live_metrics
         assert live_metrics["subscriptions"] > 50, live_metrics
+        assert any(
+            "Vector.vector_install_payload_watcher" in record.get("label", "")
+            for record in transport._subs
+        ), "Vector watcher lost its slow-handler diagnostic label"
 
         # Silent Tags can wake Vector's unrelated outgoing watcher.  This suite
         # checks Telegram routing, not Vector's external bot endpoint.
@@ -1060,6 +1064,15 @@ class AuditDynamic(ModuleBase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             control.modules_dir = Path(temp_dir)
+
+            # Duplicate sources are skipped at boot to avoid double commands.
+            # `.mun name --del` must nevertheless remove their orphaned file.
+            orphan = Path(temp_dir) / "Vector_MCUB_Repo.py"
+            orphan.write_text("# duplicate source retained on disk\n", encoding="utf-8")
+            await h.transport.inject(500, ".mun vector_mcub_repo --del", sender_id=1000, outgoing=True)
+            assert not orphan.exists(), "mun --del did not remove an unloaded duplicate source"
+            assert "незагруженный" in h.transport.sent[-1].text
+
             event = Message(
                 chat_id=500,
                 sender_id=1000,
@@ -1104,6 +1117,30 @@ def register(kernel):
             before = len(h.transport.sent)
             await h.transport.inject(500, ".auditfunc", sender_id=1000, outgoing=True)
             assert len(h.transport.sent) == before, "mun left functional MCUB command subscribed"
+
+            # Vector's class-style installer passes `(url, module_name)`. It
+            # must reach the same checked Control loader as `.mload`, not fail
+            # with the former one-argument TypeError.
+            url_source = '''# meta: name=audit_url_install version=1.0.0 framework=mcub
+def register(kernel):
+    @kernel.register.command("auditurl")
+    async def auditurl(event):
+        await event.edit("audit URL install works")
+'''
+            iface = control._mcub_interface()
+            assert iface is not None
+            control._download_source = lambda _url: url_source
+            try:
+                installed, detail = await iface.install_from_url(
+                    "https://example.invalid/audit_url.py", "audit_url_install"
+                )
+            finally:
+                delattr(control, "_download_source")
+            assert installed, detail
+            await h.transport.inject(500, ".auditurl", sender_id=1000, outgoing=True)
+            assert h.transport.sent[-1].text == "audit URL install works"
+            await h.transport.inject(500, ".mun audit_url_install --del", sender_id=1000, outgoing=True)
+            assert h.registry.get("audit_url_install") is None
 
         # The command catalogue comes from all adapters, not only lifecycle
         # modules, so discovery reflects what production can actually route.
@@ -1294,6 +1331,24 @@ async def owned_mcub_modules_suite() -> None:
         terminal_module.execute_in_chroot = fake_execute_in_chroot
         vector = instance_named("Vector")
         original_net_req = vector._net_req
+
+        # Regression: Vector's generic incoming watcher used to resolve its
+        # remote bot ID before checking message text, causing an API request
+        # and multi-second delay for every ordinary incoming message.
+        lookup_calls = []
+
+        async def slow_vector_lookup(*_args, **_kw):
+            lookup_calls.append(True)
+            await asyncio.sleep(0.05)
+            return None
+
+        vector.btid = 0
+        vector._btid_retry_at = 0
+        vector._net_req = slow_vector_lookup
+        await vector.vector_install_payload_watcher(
+            types.SimpleNamespace(out=False, text="ordinary incoming chat", sender_id=2000)
+        )
+        assert not lookup_calls, "Vector watcher queried its API for an unrelated message"
 
         async def fake_vector_net(method, path, **_kw):
             return {"username": "vector_audit_bot"} if path == "/api/tg-bot" else None
